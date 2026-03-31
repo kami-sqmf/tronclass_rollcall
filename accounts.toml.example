@@ -1,0 +1,13 @@
+# fju_ghost 帳號設定範例
+# 每個帳號指定要使用的 provider
+# provider 必須對應 config.toml 中 [providers.*] 的名稱
+
+[[accounts]]
+id = "my-account"
+provider = "fju"
+username = "your_student_id"
+password = "your_password"
+# captcha = ""          # 若 provider 需要驗證碼則填入（FJU 用靜態驗證碼）
+# manual_cookie = ""    # 填入後跳過自動登入，直接使用此 cookie
+# enabled = true        # 設為 false 可暫時停用此帳號
+# line_user_id = ""     # Line User ID，用於接收個人通知
