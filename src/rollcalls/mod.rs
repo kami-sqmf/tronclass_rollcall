@@ -22,7 +22,7 @@ use crate::api::{
     ApiClient,
 };
 use crate::config::AppConfig;
-use crate::line_bot::LineBotClient;
+use crate::adapters::line::LineBotClient;
 
 use self::number::{brute_force_number_rollcall, BruteForceResult};
 use self::qrcode::{attempt_qrcode_rollcall, QrCodeResult};

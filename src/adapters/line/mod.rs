@@ -56,7 +56,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::LineBotConfig;
-use crate::rollcall::QrCodeSender;
+use crate::rollcalls::QrCodeSender;
 
 use self::types::{
     BotCommand, Event, LineMessage, MonitorStatus, PushMessageRequest, ReplyMessageRequest,

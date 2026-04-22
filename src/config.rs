@@ -1,7 +1,4 @@
 //! 設定管理模組
-//!
-//! `config.toml` 僅存放全域設定與 CAS provider。
-//! 多帳號資料由獨立的 `accounts.toml` 管理，載入後會解析成可直接執行的 `AccountConfig`。
 
 use std::collections::BTreeMap;
 use std::fs;

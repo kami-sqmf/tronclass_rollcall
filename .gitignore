@@ -1,3 +1,4 @@
 /target
 accounts.toml
 config.toml
+.DS_Store

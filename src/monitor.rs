@@ -34,12 +34,12 @@ use miette::{Result, WrapErr};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::adapters::line::types::MonitorStatus;
+use crate::adapters::line::{LineBotClient, WebhookState};
 use crate::api::{is_auth_error, ApiClient};
 use crate::auth::AuthClient;
 use crate::config::{AccountConfig, AppConfig};
-use crate::line_bot::types::MonitorStatus;
-use crate::line_bot::{LineBotClient, WebhookState};
-use crate::rollcall::{
+use crate::rollcalls::{
     create_qrcode_channel, process_rollcall_batch, BatchSummary, QrCodeReceiver, QrCodeSender,
 };
 
@@ -815,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_integration() {
-        use crate::rollcall::create_qrcode_channel;
+        use crate::rollcalls::create_qrcode_channel;
 
         let (tx, rx) = create_qrcode_channel(2);
 
@@ -830,7 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_overflow() {
-        use crate::rollcall::create_qrcode_channel;
+        use crate::rollcalls::create_qrcode_channel;
 
         let (tx, _rx) = create_qrcode_channel(1); // 容量只有 1
 

@@ -34,10 +34,16 @@ cargo run --release
 
 ## 專案結構 Project Structure
 ```
+config/
+├── config.toml           # 系統設定
+└── accounts.toml         # 帳號設定
 src/
 ├── main.rs               # 主程式進入點
+├── config.rs             # 設定管理模組
+├── monitor.rs            # 主監控循環模組
 ├── api/
 │   ├── mod.rs            # API 交流模組
+│   ├── profile.rs        # 資訊 API
 │   └── rollcall.rs       # 點名 API
 ├── auth/
 │   ├── mod.rs            # 認證主邏輯模組

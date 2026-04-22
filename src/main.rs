@@ -12,13 +12,14 @@
 //! Credits:
 //! [KrsMt-0113/XMU-Rollcall-Bot](https://github.com/KrsMt-0113/XMU-Rollcall-Bot)
 
+mod adapters;
 mod api;
 mod auth;
 mod config;
 mod db;
 mod line_bot;
 mod monitor;
-mod rollcall;
+mod rollcalls;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,8 +59,8 @@ struct CliArgs {
 impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
-        let mut config_path = PathBuf::from("config.toml");
-        let mut accounts_path = PathBuf::from("accounts.db");
+        let mut config_path = PathBuf::from("config/config.toml");
+        let mut accounts_path = PathBuf::from("config/accounts.toml");
         let mut show_version = false;
         let mut show_help = false;
         let mut validate_only = false;
@@ -344,7 +345,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(config);
     let line_bot = if config.line_bot.enabled {
-        match line_bot::LineBotClient::new(&config.line_bot) {
+        match adapters::line::LineBotClient::new(&config.line_bot) {
             Ok(bot) => Some(Arc::new(bot)),
             Err(e) => {
                 warn!(error = %e, "Line Bot 初始化失敗，將在無 Line Bot 模式下運行");
@@ -393,7 +394,7 @@ async fn main() -> Result<()> {
 
             let handle = tokio::spawn(async move {
                 if let Err(e) =
-                    line_bot::start_webhook_server(webhook_state, port, &webhook_path).await
+                    adapters::line::start_webhook_server(webhook_state, port, &webhook_path).await
                 {
                     error!(error = %e, "Webhook 伺服器異常退出");
                 }
