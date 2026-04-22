@@ -3,7 +3,7 @@
 //! 負責：
 //! 1. 解析命令列參數（設定檔路徑）
 //! 2. 初始化日誌（tracing）
-//! 3. 載入並驗證設定（config.toml + accounts.toml）
+//! 3. 載入並驗證設定（config.toml + accounts.db）
 //! 4. 建立監控器上下文（每帳號各自登錄 + 共用 Line Bot）
 //! 5. 啟動 Webhook 伺服器（若 Line Bot 啟用）
 //! 6. 進入主監控循環
@@ -15,6 +15,7 @@
 mod api;
 mod auth;
 mod config;
+mod db;
 mod line_bot;
 mod monitor;
 mod rollcall;
@@ -41,7 +42,7 @@ struct CliArgs {
     /// 設定檔路徑（預設：`./config.toml`）
     config_path: PathBuf,
 
-    /// 帳號檔路徑（預設：`./accounts.toml`）
+    /// 帳號資料庫路徑（預設：`./accounts.db`）
     accounts_path: PathBuf,
 
     /// 是否印出版本資訊後退出
@@ -58,7 +59,7 @@ impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let mut config_path = PathBuf::from("config.toml");
-        let mut accounts_path = PathBuf::from("accounts.toml");
+        let mut accounts_path = PathBuf::from("accounts.db");
         let mut show_version = false;
         let mut show_help = false;
         let mut validate_only = false;
@@ -137,18 +138,22 @@ fn print_help() {
     println!();
     println!("用法：");
     println!("  fju_ghost [選項] [設定檔路徑]");
-    println!("  fju_ghost init [--force] [-c <PATH>] [-a <PATH>]");
+    println!("  fju_ghost init [--force] [-c <PATH>]");
     println!();
     println!("子命令：");
-    println!("  init                 產生預設 config.toml 與 accounts.toml");
+    println!("  init                 產生預設 config.toml");
     println!("    --force, -f        覆蓋已存在的檔案");
     println!();
     println!("選項：");
-    println!("  -c, --config <PATH>  指定設定檔路徑（預設：./config.toml）");
-    println!("  -a, --accounts <PATH> 指定帳號檔路徑（預設：./accounts.toml）");
-    println!("  --validate           只驗證設定檔，不啟動程式");
-    println!("  -v, --version        顯示版本資訊");
-    println!("  -h, --help           顯示此說明");
+    println!("  -c, --config <PATH>   指定設定檔路徑（預設：./config.toml）");
+    println!("  -a, --accounts <PATH> 指定帳號資料庫路徑（預設：./accounts.db）");
+    println!("  --validate            只驗證設定檔，不啟動程式");
+    println!("  -v, --version         顯示版本資訊");
+    println!("  -h, --help            顯示此說明");
+    println!();
+    println!("帳號管理：");
+    println!("  帳號儲存於 SQLite 資料庫（預設：accounts.db）");
+    println!("  可使用 sqlitebrowser 或 sqlite3 CLI 直接管理帳號。");
     println!();
     println!("環境變數：");
     println!("  FJU_GHOST__API__BASE_URL      覆蓋設定檔中的 API base URL");
@@ -161,11 +166,10 @@ fn print_help() {
 // ─── 設定初始化 ───────────────────────────────────────────────────────────────
 
 const CONFIG_EXAMPLE: &str = include_str!("../config.toml.example");
-const ACCOUNTS_EXAMPLE: &str = include_str!("../accounts.toml.example");
 
-fn run_init(config_path: &PathBuf, accounts_path: &PathBuf, force: bool) -> std::io::Result<()> {
+fn run_init(config_path: &PathBuf, force: bool) -> std::io::Result<()> {
     write_init_file(config_path, CONFIG_EXAMPLE, force)?;
-    write_init_file(accounts_path, ACCOUNTS_EXAMPLE, force)?;
+    println!("💡 帳號資料庫將在首次啟動時自動建立（預設：accounts.db）");
     Ok(())
 }
 
@@ -250,7 +254,7 @@ async fn main() -> Result<()> {
 
     // ── init 子命令 ────────────────────────────────────────────────────────────
     if let Subcommand::Init { force } = args.subcommand {
-        run_init(&args.config_path, &args.accounts_path, force)
+        run_init(&args.config_path, force)
             .map_err(|e| miette::miette!("init 失敗：{e}"))?;
         return Ok(());
     }
@@ -275,21 +279,21 @@ async fn main() -> Result<()> {
         }
     };
 
-    let accounts_file = match config::AccountsFile::load(&args.accounts_path) {
-        Ok(accounts) => {
+    let accounts_db = match db::AccountsDb::open(&args.accounts_path).await {
+        Ok(db) => {
             info!(
                 accounts_path = %args.accounts_path.display(),
-                "帳號檔載入成功"
+                "帳號資料庫開啟成功"
             );
-            accounts
+            db
         }
         Err(e) => {
             error!(
                 error = %e,
                 accounts_path = %args.accounts_path.display(),
-                "帳號檔載入失敗"
+                "帳號資料庫開啟失敗"
             );
-            eprintln!("\n❌ 帳號檔載入失敗：{e}");
+            eprintln!("\n❌ 帳號資料庫開啟失敗：{e}");
             return Err(e);
         }
     };
@@ -301,7 +305,7 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    let accounts = match accounts_file.resolve(&config) {
+    let accounts = match accounts_db.resolve(&config).await {
         Ok(accounts) => accounts,
         Err(e) => {
             error!(error = %e, "帳號設定驗證失敗");
@@ -321,7 +325,7 @@ async fn main() -> Result<()> {
     );
     if validate_only {
         println!("✅ 設定檔驗證通過：{}", args.config_path.display());
-        println!("✅ 帳號檔驗證通過：{}", args.accounts_path.display());
+        println!("✅ 帳號資料庫驗證通過：{}", args.accounts_path.display());
         println!("啟用帳號數：{}", accounts.len());
         println!("{config}");
         return Ok(());
@@ -333,7 +337,7 @@ async fn main() -> Result<()> {
     info!(
         version = VERSION,
         config = %args.config_path.display(),
-        accounts = %args.accounts_path.display(),
+        accounts_db = %args.accounts_path.display(),
         log_level = %config.logging.level,
         "設定載入完成"
     );
