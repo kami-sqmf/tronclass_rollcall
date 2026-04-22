@@ -66,6 +66,9 @@ chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
 rand = "0.10.0"
 
+# Database (SQLite)
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+
 [dev-dependencies]
 tempfile = "3"
 
