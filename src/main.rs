@@ -12,12 +12,12 @@
 //! Credits:
 //! [KrsMt-0113/XMU-Rollcall-Bot](https://github.com/KrsMt-0113/XMU-Rollcall-Bot)
 
+mod account;
 mod adapters;
 mod api;
 mod auth;
 mod config;
 mod db;
-mod line_bot;
 mod monitor;
 mod rollcalls;
 
@@ -28,6 +28,147 @@ use miette::Result;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+// ─── 帳號管理子命令 ───────────────────────────────────────────────────────────
+
+enum AccountCmd {
+    List,
+    Show {
+        id: String,
+    },
+    Add {
+        id: String,
+        provider: String,
+        username: String,
+        password: String,
+        line_user_id: String,
+        enabled: bool,
+    },
+    Remove {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+}
+
+impl AccountCmd {
+    fn parse_from(args: &[String], i: &mut usize) -> Self {
+        let subcmd = args.get(*i).map(String::as_str).unwrap_or("");
+        match subcmd {
+            "list" => Self::List,
+            "show" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "show", "<id>");
+                Self::Show { id }
+            }
+            "add" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "add", "<id>");
+                let mut provider = String::new();
+                let mut username = String::new();
+                let mut password = String::new();
+                let mut line_user_id = String::new();
+                let mut enabled = true;
+                *i += 1;
+                while *i < args.len() {
+                    match args[*i].as_str() {
+                        "-p" | "--provider" => {
+                            *i += 1;
+                            provider = cli_require_value(args, *i, "--provider");
+                        }
+                        "-u" | "--username" => {
+                            *i += 1;
+                            username = cli_require_value(args, *i, "--username");
+                        }
+                        "-P" | "--password" => {
+                            *i += 1;
+                            password = cli_require_value(args, *i, "--password");
+                        }
+                        "--line-user-id" => {
+                            *i += 1;
+                            line_user_id = cli_require_value(args, *i, "--line-user-id");
+                        }
+                        "--disabled" => enabled = false,
+                        other => {
+                            eprintln!("未知引數：{other}");
+                            std::process::exit(1);
+                        }
+                    }
+                    *i += 1;
+                }
+                if provider.is_empty() {
+                    eprintln!("錯誤：account add 需要 -p/--provider");
+                    std::process::exit(1);
+                }
+                if username.is_empty() {
+                    eprintln!("錯誤：account add 需要 -u/--username");
+                    std::process::exit(1);
+                }
+                if password.is_empty() {
+                    eprintln!("錯誤：account add 需要 -P/--password");
+                    std::process::exit(1);
+                }
+                Self::Add {
+                    id,
+                    provider,
+                    username,
+                    password,
+                    line_user_id,
+                    enabled,
+                }
+            }
+            "remove" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "remove", "<id>");
+                Self::Remove { id }
+            }
+            "enable" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "enable", "<id>");
+                Self::Enable { id }
+            }
+            "disable" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "disable", "<id>");
+                Self::Disable { id }
+            }
+            "" => {
+                eprintln!(
+                    "錯誤：account 需要子命令\n用法：account <list|show|add|remove|enable|disable>"
+                );
+                std::process::exit(1);
+            }
+            other => {
+                eprintln!("未知的 account 子命令：{other}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn cli_require_positional(args: &[String], i: usize, cmd: &str, name: &str) -> String {
+    match args.get(i) {
+        Some(v) if !v.starts_with('-') => v.clone(),
+        _ => {
+            eprintln!("錯誤：account {cmd} 需要 {name}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cli_require_value(args: &[String], i: usize, flag: &str) -> String {
+    match args.get(i) {
+        Some(v) => v.clone(),
+        None => {
+            eprintln!("錯誤：{flag} 需要一個值");
+            std::process::exit(1);
+        }
+    }
+}
+
 // ─── 命令列引數 ───────────────────────────────────────────────────────────────
 
 /// CLI 子命令
@@ -36,14 +177,16 @@ enum Subcommand {
     Run { validate_only: bool },
     /// 初始化設定檔
     Init { force: bool },
+    /// 帳號管理
+    Account(AccountCmd),
 }
 
 /// 命令列引數結構
 struct CliArgs {
-    /// 設定檔路徑（預設：`./config.toml`）
+    /// 設定檔路徑（預設：`./config/config.toml`）
     config_path: PathBuf,
 
-    /// 帳號資料庫路徑（預設：`./accounts.db`）
+    /// 帳號資料庫路徑（預設：`./config/accounts.db`）
     accounts_path: PathBuf,
 
     /// 是否印出版本資訊後退出
@@ -60,20 +203,20 @@ impl CliArgs {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().collect();
         let mut config_path = PathBuf::from("config/config.toml");
-        let mut accounts_path = PathBuf::from("config/accounts.toml");
+        let mut accounts_path = PathBuf::from("config/accounts.db");
         let mut show_version = false;
         let mut show_help = false;
         let mut validate_only = false;
-        let mut is_init = false;
         let mut init_force = false;
+        let mut subcommand_tag: Option<&'static str> = None;
+        let mut account_cmd: Option<AccountCmd> = None;
 
-        let mut i = 1;
+        let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
                 "-v" | "--version" => show_version = true,
                 "-h" | "--help" => show_help = true,
                 "--validate" => validate_only = true,
-                "init" => is_init = true,
                 "--force" | "-f" => init_force = true,
                 "-c" | "--config" => {
                     i += 1;
@@ -93,23 +236,28 @@ impl CliArgs {
                         std::process::exit(1);
                     }
                 }
+                "init" => subcommand_tag = Some("init"),
+                "account" => {
+                    subcommand_tag = Some("account");
+                    i += 1;
+                    account_cmd = Some(AccountCmd::parse_from(&args, &mut i));
+                    break;
+                }
+                other if !other.starts_with('-') && subcommand_tag.is_none() => {
+                    config_path = PathBuf::from(other);
+                }
                 other => {
-                    // 如果是第一個非 flag 引數，當作 config 路徑
-                    if !other.starts_with('-') && config_path == PathBuf::from("config.toml") {
-                        config_path = PathBuf::from(other);
-                    } else {
-                        eprintln!("未知引數：{other}");
-                        std::process::exit(1);
-                    }
+                    eprintln!("未知引數：{other}");
+                    std::process::exit(1);
                 }
             }
             i += 1;
         }
 
-        let subcommand = if is_init {
-            Subcommand::Init { force: init_force }
-        } else {
-            Subcommand::Run { validate_only }
+        let subcommand = match subcommand_tag {
+            Some("init") => Subcommand::Init { force: init_force },
+            Some("account") => Subcommand::Account(account_cmd.unwrap()),
+            _ => Subcommand::Run { validate_only },
         };
 
         Self {
@@ -138,39 +286,46 @@ fn print_help() {
     println!("{DESCRIPTION}");
     println!();
     println!("用法：");
-    println!("  fju_ghost [選項] [設定檔路徑]");
-    println!("  fju_ghost init [--force] [-c <PATH>]");
+    println!("  {PKG_NAME} [選項] [設定檔路徑]");
+    println!("  {PKG_NAME} init [--force] [-c <PATH>]");
+    println!("  {PKG_NAME} account <子命令> [-a <PATH>]");
     println!();
     println!("子命令：");
-    println!("  init                 產生預設 config.toml");
-    println!("    --force, -f        覆蓋已存在的檔案");
+    println!("  init                       產生預設 config.toml");
+    println!("    --force, -f              覆蓋已存在的檔案");
+    println!();
+    println!("  account list               列出所有帳號");
+    println!("  account show <id>          顯示帳號詳情");
+    println!("  account add <id>           新增帳號");
+    println!("    -p, --provider <name>      Provider 名稱（必填）");
+    println!("    -u, --username <user>      使用者名稱（必填）");
+    println!("    -P, --password <pass>      密碼（必填）");
+    println!("    --line-user-id <uid>       Line User ID（選填）");
+    println!("    --disabled                 新增時停用帳號");
+    println!("  account remove <id>        刪除帳號");
+    println!("  account enable <id>        啟用帳號");
+    println!("  account disable <id>       停用帳號");
     println!();
     println!("選項：");
-    println!("  -c, --config <PATH>   指定設定檔路徑（預設：./config.toml）");
-    println!("  -a, --accounts <PATH> 指定帳號資料庫路徑（預設：./accounts.db）");
-    println!("  --validate            只驗證設定檔，不啟動程式");
-    println!("  -v, --version         顯示版本資訊");
-    println!("  -h, --help            顯示此說明");
-    println!();
-    println!("帳號管理：");
-    println!("  帳號儲存於 SQLite 資料庫（預設：accounts.db）");
-    println!("  可使用 sqlitebrowser 或 sqlite3 CLI 直接管理帳號。");
+    println!("  -c, --config <PATH>    指定設定檔路徑（預設：config/config.toml）");
+    println!("  -a, --accounts <PATH>  指定帳號資料庫路徑（預設：config/accounts.db）");
+    println!("  --validate             只驗證設定檔，不啟動程式");
+    println!("  -v, --version          顯示版本資訊");
+    println!("  -h, --help             顯示此說明");
     println!();
     println!("環境變數：");
-    println!("  FJU_GHOST__API__BASE_URL      覆蓋設定檔中的 API base URL");
-    println!("  RUST_LOG                      控制日誌等級（例如：info, debug）");
-    println!();
-    println!("更多資訊：");
-    println!("  https://github.com/your-username/fju_ghost");
+    println!("  TRONCLASS_ROLLCALL__PROVIDERS__<name>__BASE_URL  覆蓋設定中的 Base URL");
+    println!("  RUST_LOG                                          控制日誌等級（info, debug…）");
 }
 
 // ─── 設定初始化 ───────────────────────────────────────────────────────────────
 
-const CONFIG_EXAMPLE: &str = include_str!("../config.toml.example");
+const CONFIG_EXAMPLE: &str = include_str!("../config/config.toml.example");
 
 fn run_init(config_path: &PathBuf, force: bool) -> std::io::Result<()> {
     write_init_file(config_path, CONFIG_EXAMPLE, force)?;
-    println!("💡 帳號資料庫將在首次啟動時自動建立（預設：accounts.db）");
+    println!("💡 帳號資料庫將在首次啟動時自動建立（預設：config/accounts.db）");
+    println!("💡 使用 `{PKG_NAME} account add` 新增帳號");
     Ok(())
 }
 
@@ -179,8 +334,110 @@ fn write_init_file(path: &PathBuf, content: &str, force: bool) -> std::io::Resul
         eprintln!("⚠️  已存在：{}（使用 --force 強制覆蓋）", path.display());
         return Ok(());
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, content)?;
     println!("✅ 已建立：{}", path.display());
+    Ok(())
+}
+
+// ─── 帳號管理指令執行 ─────────────────────────────────────────────────────────
+
+async fn run_account_cmd(db: db::AccountsDb, cmd: AccountCmd) -> Result<()> {
+    use account::RawAccountConfig;
+
+    match cmd {
+        AccountCmd::List => {
+            let accounts = db.list().await?;
+            if accounts.is_empty() {
+                println!("（沒有帳號）");
+            } else {
+                println!(
+                    "{:<20} {:<12} {:<30} {:<8} {}",
+                    "ID", "Provider", "Username", "Enabled", "Line User ID"
+                );
+                println!("{}", "─".repeat(88));
+                for a in &accounts {
+                    println!(
+                        "{:<20} {:<12} {:<30} {:<8} {}",
+                        a.id,
+                        a.provider,
+                        a.username,
+                        if a.enabled { "✓" } else { "✗" },
+                        a.line_user_id,
+                    );
+                }
+                println!();
+                println!("共 {} 個帳號", accounts.len());
+            }
+        }
+        AccountCmd::Show { id } => match db.get(&id).await? {
+            None => {
+                eprintln!("找不到帳號：{id}");
+                std::process::exit(1);
+            }
+            Some(a) => {
+                println!("ID:           {}", a.id);
+                println!("Provider:     {}", a.provider);
+                println!("Username:     {}", a.username);
+                println!("Password:     {}", "*".repeat(a.password.len().min(16)));
+                println!("Enabled:      {}", if a.enabled { "是" } else { "否" });
+                println!(
+                    "Line User ID: {}",
+                    if a.line_user_id.is_empty() {
+                        "(未設定)"
+                    } else {
+                        &a.line_user_id
+                    }
+                );
+            }
+        },
+        AccountCmd::Add {
+            id,
+            provider,
+            username,
+            password,
+            line_user_id,
+            enabled,
+        } => {
+            let account = RawAccountConfig {
+                id: id.clone(),
+                provider,
+                username,
+                password,
+                enabled,
+                line_user_id,
+            };
+            db.insert(&account).await?;
+            println!("✅ 已新增帳號：{id}");
+        }
+        AccountCmd::Remove { id } => {
+            if db.delete(&id).await? {
+                println!("✅ 已刪除帳號：{id}");
+            } else {
+                eprintln!("找不到帳號：{id}");
+                std::process::exit(1);
+            }
+        }
+        AccountCmd::Enable { id } => {
+            if db.set_enabled(&id, true).await? {
+                println!("✅ 已啟用帳號：{id}");
+            } else {
+                eprintln!("找不到帳號：{id}");
+                std::process::exit(1);
+            }
+        }
+        AccountCmd::Disable { id } => {
+            if db.set_enabled(&id, false).await? {
+                println!("✅ 已停用帳號：{id}");
+            } else {
+                eprintln!("找不到帳號：{id}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -193,7 +450,6 @@ fn write_init_file(path: &PathBuf, content: &str, force: bool) -> std::io::Resul
 /// 2. `config.logging.level` 設定
 /// 3. 預設 `info`
 fn init_tracing(log_level: &str) {
-    // 若 RUST_LOG 已設定，優先使用
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
@@ -207,16 +463,13 @@ fn init_tracing(log_level: &str) {
                 .with_thread_ids(false)
                 .with_file(false)
                 .with_line_number(false)
-                // 在 terminal 輸出彩色格式
                 .with_ansi(supports_ansi()),
         )
         .with(filter)
         .init();
 }
 
-/// 判斷終端是否支援 ANSI 彩色輸出
 fn supports_ansi() -> bool {
-    // 若輸出不是 TTY（例如重定向到檔案），不使用顏色
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -224,7 +477,7 @@ fn supports_ansi() -> bool {
     }
     #[cfg(not(unix))]
     {
-        true // Windows 現代終端通常支援 ANSI
+        true
     }
 }
 
@@ -253,14 +506,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── init 子命令 ────────────────────────────────────────────────────────────
-    if let Subcommand::Init { force } = args.subcommand {
-        run_init(&args.config_path, force)
-            .map_err(|e| miette::miette!("init 失敗：{e}"))?;
-        return Ok(());
-    }
+    // ── 子命令分發 ─────────────────────────────────────────────────────────────
+    let validate_only = match args.subcommand {
+        Subcommand::Init { force } => {
+            run_init(&args.config_path, force).map_err(|e| miette::miette!("init 失敗：{e}"))?;
+            return Ok(());
+        }
+        // account 子命令不需要 config.toml
+        Subcommand::Account(cmd) => {
+            let db = db::AccountsDb::open(&args.accounts_path)
+                .await
+                .map_err(|e| miette::miette!("無法開啟帳號資料庫：{e}"))?;
+            return run_account_cmd(db, cmd).await;
+        }
+        Subcommand::Run { validate_only } => validate_only,
+    };
 
-    eprintln!("🎓 FJU Ghost Student v{VERSION} 啟動中...");
+    eprintln!("🎓 {PKG_NAME} v{VERSION} 啟動中...");
 
     // ── 2. 載入設定 ────────────────────────────────────────────────────────────
     let config = match config::AppConfig::load(&args.config_path) {
@@ -274,8 +536,7 @@ async fn main() -> Result<()> {
             eprintln!("\n❌ 設定檔載入失敗：{e}");
             eprintln!("\n💡 提示：");
             eprintln!("  - 請確認設定檔路徑正確：{}", args.config_path.display());
-            eprintln!("  - 可以複製 config.toml.example 為 config.toml 並填入設定");
-            eprintln!("  - 再複製 accounts.toml.example 為 accounts.toml 並填入帳號");
+            eprintln!("  - 執行 `{PKG_NAME} init` 產生預設設定檔");
             return Err(e);
         }
     };
@@ -295,11 +556,12 @@ async fn main() -> Result<()> {
                 "帳號資料庫開啟失敗"
             );
             eprintln!("\n❌ 帳號資料庫開啟失敗：{e}");
+            eprintln!("  - 執行 `{PKG_NAME} account add` 新增帳號");
             return Err(e);
         }
     };
 
-    // ── 4. 驗證設定 ────────────────────────────────────────────────────────────
+    // ── 3. 驗證設定 ────────────────────────────────────────────────────────────
     if let Err(e) = config.validate() {
         error!(error = %e, "設定驗證失敗");
         eprintln!("\n❌ 設定驗證失敗：{e}");
@@ -317,13 +579,6 @@ async fn main() -> Result<()> {
 
     info!(account_count = accounts.len(), "設定驗證通過");
 
-    // 若只是驗證，到此結束
-    let validate_only = matches!(
-        args.subcommand,
-        Subcommand::Run {
-            validate_only: true
-        }
-    );
     if validate_only {
         println!("✅ 設定檔驗證通過：{}", args.config_path.display());
         println!("✅ 帳號資料庫驗證通過：{}", args.accounts_path.display());
@@ -344,8 +599,8 @@ async fn main() -> Result<()> {
     );
 
     let config = Arc::new(config);
-    let line_bot = if config.line_bot.enabled {
-        match adapters::line::LineBotClient::new(&config.line_bot) {
+    let line_bot = if config.adapters.line_bot.enabled {
+        match adapters::line::LineBotClient::new(&config.adapters.line_bot) {
             Ok(bot) => Some(Arc::new(bot)),
             Err(e) => {
                 warn!(error = %e, "Line Bot 初始化失敗，將在無 Line Bot 模式下運行");
@@ -356,12 +611,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ── 5. 建立監控器上下文 ────────────────────────────────────────────────────
+    // ── 4. 建立監控器上下文 ────────────────────────────────────────────────────
     info!(account_count = accounts.len(), "初始化監控器...");
-    let interactive_line = line_bot.is_some() && accounts.len() == 1;
-    if line_bot.is_some() && accounts.len() > 1 {
-        warn!("多帳號模式下暫不啟用 Webhook 控制與 QR Code 回傳；保留推播通知");
-    }
+    let interactive_line = line_bot.is_some();
 
     let mut contexts = Vec::with_capacity(accounts.len());
     for account in accounts {
@@ -384,11 +636,17 @@ async fn main() -> Result<()> {
         contexts.push(ctx);
     }
 
-    // ── 6. 啟動 Webhook 伺服器（背景任務） ───────────────────────────────────
+    // ── 5. 啟動 Webhook 伺服器（背景任務） ───────────────────────────────────
     let webhook_handle = if interactive_line {
-        if let Some(webhook_state) = contexts.get_mut(0).and_then(|ctx| ctx.webhook_state.take()) {
-            let port = config.line_bot.webhook_port;
-            let webhook_path = config.line_bot.webhook_path.clone();
+        if let Some(bot) = line_bot.as_ref() {
+            let webhook_accounts = contexts
+                .iter()
+                .filter_map(|ctx| ctx.webhook_account.clone())
+                .collect::<Vec<_>>();
+            let webhook_state =
+                adapters::line::WebhookState::new(Arc::clone(bot), webhook_accounts);
+            let port = config.adapters.line_bot.webhook_port;
+            let webhook_path = config.adapters.line_bot.webhook_path.clone();
 
             info!(port = port, path = %webhook_path, "啟動 Line Bot Webhook 伺服器...");
 
@@ -405,7 +663,7 @@ async fn main() -> Result<()> {
 
             Some(handle)
         } else {
-            warn!("Line Bot 啟用但 Webhook 狀態未初始化，跳過 Webhook 伺服器");
+            warn!("Line Bot 啟用但客戶端未初始化，跳過 Webhook 伺服器");
             None
         }
     } else {
@@ -413,8 +671,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ── 7. 設定優雅關閉 ───────────────────────────────────────────────────────
-    // 在背景監聽 Ctrl+C（SIGINT）和 SIGTERM
+    // ── 6. 設定優雅關閉 ───────────────────────────────────────────────────────
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let shutdown_notify_clone = Arc::clone(&shutdown_notify);
 
@@ -424,7 +681,7 @@ async fn main() -> Result<()> {
         shutdown_notify_clone.notify_one();
     });
 
-    // ── 8. 進入主監控循環（帶優雅關閉） ──────────────────────────────────────
+    // ── 7. 進入主監控循環（帶優雅關閉） ──────────────────────────────────────
     info!(account_count = contexts.len(), "🚀 開始監控簽到...");
 
     let mut monitor_tasks = tokio::task::JoinSet::new();
@@ -470,25 +727,23 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── 9. 清理資源 ───────────────────────────────────────────────────────────
+    // ── 8. 清理資源 ───────────────────────────────────────────────────────────
     info!("清理資源...");
 
     monitor_tasks.abort_all();
 
-    // 取消 Webhook 伺服器
     if let Some(handle) = webhook_handle {
         handle.abort();
         info!("Webhook 伺服器已關閉");
     }
 
-    info!("👋 FJU Rollcall 已關閉，再見！");
+    info!("👋 {} 已關閉，再見！", PKG_NAME);
 
     Ok(())
 }
 
 // ─── 關閉信號 ─────────────────────────────────────────────────────────────────
 
-/// 等待關閉信號（Ctrl+C 或 SIGTERM）
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
@@ -511,34 +766,9 @@ async fn wait_for_shutdown_signal() {
 
     #[cfg(not(unix))]
     {
-        // Windows 只支援 Ctrl+C
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to register Ctrl+C handler");
         info!("收到 Ctrl+C 信號");
     }
-}
-
-// ─── 啟動橫幅 ─────────────────────────────────────────────────────────────────
-
-/// 印出啟動橫幅（ASCII art）
-#[allow(dead_code)]
-fn print_banner() {
-    println!(
-        r#"
-  _____ _ _   _    _  ____  _               _
- |  ___| | | | |  | |/ ___|| |__   ___  ___| |_
- | |_  | | | | |  | | |  _ | '_ \ / _ \/ __| __|
- |  _| | | |_| | _| | |_| || | | | (_) \__ \ |_
- |_|   | |\___/|_|\_\\____||_| |_|\___/|___/\__|
-       |_|
-  ____  _             _            _
- / ___|| |_ _   _  __| | ___ _ __ | |_
- \___ \| __| | | |/ _` |/ _ \ '_ \| __|
-  ___) | |_| |_| | (_| |  __/ | | | |_
- |____/ \__|\__,_|\__,_|\___|_| |_|\__|
-
-  v{VERSION} — 輔仁大學 Tronclass 自動簽到系統
-"#
-    );
 }

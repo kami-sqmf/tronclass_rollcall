@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::{cookie::Jar, Client};
 
-use crate::config::{AccountConfig, ProviderConfig};
+use crate::account::AccountConfig;
 
 use super::AuthSession;
 
@@ -24,10 +23,6 @@ pub(crate) trait AuthFlow: Send + Sync {
 }
 
 // ─── Provider registry ───────────────────────────────────────────────────────
-
-pub fn builtin_providers() -> BTreeMap<String, ProviderConfig> {
-    BTreeMap::from([(String::from("fju"), fju::provider_config())])
-}
 
 pub(crate) fn get_auth_flow(provider_name: &str) -> Box<dyn AuthFlow> {
     match provider_name {

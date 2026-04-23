@@ -1,6 +1,5 @@
 //! 帳號資料庫模組
 //!
-//! 以 SQLite 取代 `accounts.toml`，提供帳號的 CRUD 操作。
 //! 資料庫檔案預設為 `accounts.db`，可透過 `-a/--accounts` 指定路徑。
 
 use std::path::Path;
@@ -8,7 +7,8 @@ use std::path::Path;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
 
-use crate::config::{AccountConfig, AccountsFile, AppConfig, RawAccountConfig};
+use crate::account::{AccountConfig, AccountsFile, RawAccountConfig};
+use crate::config::AppConfig;
 
 // ─── 資料庫列映射 ─────────────────────────────────────────────────────────────
 
@@ -18,8 +18,6 @@ struct AccountRow {
     provider: String,
     username: String,
     password: String,
-    captcha: String,
-    manual_cookie: String,
     enabled: bool,
     line_user_id: String,
 }
@@ -31,8 +29,6 @@ impl From<AccountRow> for RawAccountConfig {
             provider: row.provider,
             username: row.username,
             password: row.password,
-            captcha: row.captcha,
-            manual_cookie: row.manual_cookie,
             enabled: row.enabled,
             line_user_id: row.line_user_id,
         }
@@ -64,8 +60,6 @@ impl AccountsDb {
                 provider     TEXT NOT NULL DEFAULT '',
                 username     TEXT NOT NULL DEFAULT '',
                 password     TEXT NOT NULL DEFAULT '',
-                captcha      TEXT NOT NULL DEFAULT '',
-                manual_cookie TEXT NOT NULL DEFAULT '',
                 enabled      INTEGER NOT NULL DEFAULT 1,
                 line_user_id TEXT NOT NULL DEFAULT ''
             )",
@@ -83,7 +77,7 @@ impl AccountsDb {
     /// 取得所有帳號（依 id 排序）。
     pub async fn list(&self) -> Result<Vec<RawAccountConfig>> {
         let rows = sqlx::query_as::<_, AccountRow>(
-            "SELECT id, provider, username, password, captcha, manual_cookie, enabled, line_user_id
+            "SELECT id, provider, username, password, enabled, line_user_id
              FROM accounts ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -97,7 +91,7 @@ impl AccountsDb {
     /// 以 id 取得單一帳號。
     pub async fn get(&self, id: &str) -> Result<Option<RawAccountConfig>> {
         let row = sqlx::query_as::<_, AccountRow>(
-            "SELECT id, provider, username, password, captcha, manual_cookie, enabled, line_user_id
+            "SELECT id, provider, username, password, enabled, line_user_id
              FROM accounts WHERE id = ?",
         )
         .bind(id)
@@ -114,15 +108,13 @@ impl AccountsDb {
     /// 新增帳號；若 id 已存在則回傳錯誤。
     pub async fn insert(&self, account: &RawAccountConfig) -> Result<()> {
         sqlx::query(
-            "INSERT INTO accounts (id, provider, username, password, captcha, manual_cookie, enabled, line_user_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO accounts (id, provider, username, password, enabled, line_user_id)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&account.id)
         .bind(&account.provider)
         .bind(&account.username)
         .bind(&account.password)
-        .bind(&account.captcha)
-        .bind(&account.manual_cookie)
         .bind(account.enabled)
         .bind(&account.line_user_id)
         .execute(&self.pool)
@@ -135,14 +127,12 @@ impl AccountsDb {
     /// 新增或更新帳號（upsert）。
     pub async fn upsert(&self, account: &RawAccountConfig) -> Result<()> {
         sqlx::query(
-            "INSERT INTO accounts (id, provider, username, password, captcha, manual_cookie, enabled, line_user_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "INSERT INTO accounts (id, provider, username, password, enabled, line_user_id)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                provider      = excluded.provider,
                username      = excluded.username,
                password      = excluded.password,
-               captcha       = excluded.captcha,
-               manual_cookie = excluded.manual_cookie,
                enabled       = excluded.enabled,
                line_user_id  = excluded.line_user_id",
         )
@@ -150,8 +140,6 @@ impl AccountsDb {
         .bind(&account.provider)
         .bind(&account.username)
         .bind(&account.password)
-        .bind(&account.captcha)
-        .bind(&account.manual_cookie)
         .bind(account.enabled)
         .bind(&account.line_user_id)
         .execute(&self.pool)

@@ -1,50 +1,43 @@
-# fju_ghost 全域設定範例
-# `config.toml` 只放系統設定與 provider 定義
-# 帳號請放在 `accounts.toml`
-#
-# 登入邏輯已內建於各 provider，無需在此設定。
+# tronclass_rollcall 設定範例
+# 執行 `tronclass_rollcall init` 產生此檔案，複製為 config.toml 並依需求修改。
+# 帳號請使用 `tronclass_rollcall account add` 新增至 accounts.db。
 
 # ─── Provider 設定 ───────────────────────────────────────────────────────────
-# 各 provider 的登入方式已寫在程式碼內，這裡只需指定 kind 與 base_url。
-# 若省略此區塊，程式會自動載入內建的 fju、tku、asia provider。
+# 每個 provider 代表一套 Tronclass 系統（學校）。
+# kind 可選：tronclass / fju / tku
 
 [providers.fju]
 kind = "fju"
 base_url = "https://elearn2.fju.edu.tw"
 
-# [providers.tku]
-# kind = "tku"
-# base_url = "https://your-tku-tronclass.example"
-
-# [providers.asia]
-# kind = "asia"
-# base_url = "https://your-asia-tronclass.example"
-
-# ─── API 設定 ────────────────────────────────────────────────────────────────
-
-[api]
+[providers.fju.api]
 base_url = "https://elearn2.fju.edu.tw"
 poll_interval_secs = 10
 request_timeout_secs = 30
 
-# ─── 雷達簽到設定 ────────────────────────────────────────────────────────────
-
-[radar]
+[providers.fju.radar]
 default_coords = [
-    [25.0373, 121.4315], # 輔大利瑪竇 LM
+    [25.0373, 121.4315],  # 輔大利瑪竇 LM
 ]
 accuracy = 35
 altitude = 0
 
-# ─── 數字爆破設定 ────────────────────────────────────────────────────────────
-
-[brute_force]
+[providers.fju.brute_force]
 concurrency = 200
 request_delay_ms = 0
+transient_failure_threshold = 50
+transient_failure_ratio = 0.20
+cooldown_secs = 10
+max_cooldowns = 3
+min_concurrency = 10
 
-# ─── Line Bot 設定 ───────────────────────────────────────────────────────────
+[providers.fju.qrcode]
+scanner_base_url = "https://elearn2.fju.edu.tw/scanner-jumper"
+scan_timeout_secs = 60
 
-[line_bot]
+# ─── Adapter 設定 ────────────────────────────────────────────────────────────
+
+[adapters.line_bot]
 enabled = false
 channel_secret = "your_line_channel_secret"
 channel_access_token = "your_line_channel_access_token"
@@ -52,18 +45,12 @@ webhook_port = 8080
 webhook_path = "/webhook"
 admin_user_id = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# ─── QR Code 簽到設定 ────────────────────────────────────────────────────────
-
-[qrcode]
-scanner_base_url = "https://elearn2.fju.edu.tw/scanner-jumper"
-scan_timeout_secs = 60
-
 # ─── 日誌設定 ────────────────────────────────────────────────────────────────
 
 [logging]
 level = "info"
 log_to_file = false
-log_file_path = "fju_ghost.log"
+log_file_path = "tronclass_rollcall.log"
 
 # ─── 監控設定 ────────────────────────────────────────────────────────────────
 

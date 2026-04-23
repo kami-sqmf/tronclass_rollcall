@@ -16,13 +16,13 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::account::AccountConfig;
+use crate::adapters::line::LineBotClient;
 use crate::api::{
     is_auth_error,
     rollcall::{AttendanceType, Rollcall},
     ApiClient,
 };
-use crate::config::AppConfig;
-use crate::adapters::line::LineBotClient;
 
 use self::number::{brute_force_number_rollcall, BruteForceResult};
 use self::qrcode::{attempt_qrcode_rollcall, QrCodeResult};
@@ -142,7 +142,7 @@ pub fn create_qrcode_channel(buffer: usize) -> (QrCodeSender, QrCodeReceiver) {
 pub async fn process_rollcall(
     api: Arc<ApiClient>,
     rollcall: Rollcall,
-    config: &AppConfig,
+    config: &AccountConfig,
     account_label: &str,
     line_bot: Option<&LineBotClient>,
     qr_rx: Option<QrCodeReceiver>,
@@ -267,15 +267,20 @@ pub async fn process_rollcall(
 async fn handle_number_rollcall(
     api: Arc<ApiClient>,
     rollcall: &Rollcall,
-    config: &AppConfig,
+    config: &AccountConfig,
 ) -> RollcallResult {
     info!(
         rollcall_id = rollcall.rollcall_id,
-        concurrency = config.brute_force.concurrency,
+        concurrency = config.provider_config.brute_force.concurrency,
         "開始數字爆破簽到"
     );
 
-    let result = brute_force_number_rollcall(api, rollcall.rollcall_id, &config.brute_force).await;
+    let result = brute_force_number_rollcall(
+        api,
+        rollcall.rollcall_id,
+        &config.provider_config.brute_force,
+    )
+    .await;
 
     match result {
         BruteForceResult::Found { code, attempts } => RollcallResult::Success {
@@ -298,15 +303,16 @@ async fn handle_number_rollcall(
 async fn handle_radar_rollcall(
     api: Arc<ApiClient>,
     rollcall: &Rollcall,
-    config: &AppConfig,
+    config: &AccountConfig,
 ) -> RollcallResult {
     info!(
         rollcall_id = rollcall.rollcall_id,
-        default_coords = config.radar.default_coords.len(),
+        default_coords = config.provider_config.radar.default_coords.len(),
         "開始雷達簽到"
     );
 
-    let result = attempt_radar_rollcall(api, rollcall.rollcall_id, &config.radar).await;
+    let result =
+        attempt_radar_rollcall(api, rollcall.rollcall_id, &config.provider_config.radar).await;
 
     match result {
         RadarResult::Success { coord } => RollcallResult::Success {
@@ -343,11 +349,11 @@ async fn handle_radar_rollcall(
 /// 1. 透過 Line Bot 發送掃碼請求給管理員
 /// 2. 等待管理員透過 Line Bot 回傳 QR code URL（或 p 參數）
 /// 3. 解析並呼叫 API 完成簽到
-/// 4. 若超時（`config.qrcode.scan_timeout_secs`），返回失敗
+/// 4. 若超時（`config.provider_config.qrcode.scan_timeout_secs`），返回失敗
 async fn handle_qrcode_rollcall(
     api: Arc<ApiClient>,
     rollcall: &Rollcall,
-    config: &AppConfig,
+    config: &AccountConfig,
     account_label: &str,
     line_bot: Option<&LineBotClient>,
     qr_rx: Option<QrCodeReceiver>,
@@ -357,7 +363,7 @@ async fn handle_qrcode_rollcall(
     // 構建掃碼頁面 URL（讓使用者點擊）
     let scan_url = format!(
         "{}?rollcall_id={}",
-        config.qrcode.scanner_base_url, rollcall.rollcall_id
+        config.provider_config.qrcode.scanner_base_url, rollcall.rollcall_id
     );
 
     // 發送 Line 通知，要求使用者提供 QR code
@@ -377,7 +383,7 @@ async fn handle_qrcode_rollcall(
             account_label,
             rollcall.created_by_name,
             scan_url,
-            config.qrcode.scan_timeout_secs,
+            config.provider_config.qrcode.scan_timeout_secs,
         );
 
         if let Err(e) = bot.push_message_to_admin(&msg).await {
@@ -403,10 +409,10 @@ async fn handle_qrcode_rollcall(
         };
     };
 
-    let timeout = Duration::from_secs(config.qrcode.scan_timeout_secs);
+    let timeout = Duration::from_secs(config.provider_config.qrcode.scan_timeout_secs);
     info!(
         rollcall_id = rollcall.rollcall_id,
-        timeout_secs = config.qrcode.scan_timeout_secs,
+        timeout_secs = config.provider_config.qrcode.scan_timeout_secs,
         "等待 QR code 輸入..."
     );
 
@@ -426,10 +432,13 @@ async fn handle_qrcode_rollcall(
             Err(_) => {
                 warn!(
                     rollcall_id = rollcall.rollcall_id,
-                    "QR code 等待逾時（{}秒）", config.qrcode.scan_timeout_secs
+                    "QR code 等待逾時（{}秒）", config.provider_config.qrcode.scan_timeout_secs
                 );
                 return RollcallResult::Failed {
-                    reason: format!("QR code 輸入逾時（{}秒）", config.qrcode.scan_timeout_secs),
+                    reason: format!(
+                        "QR code 輸入逾時（{}秒）",
+                        config.provider_config.qrcode.scan_timeout_secs
+                    ),
                 };
             }
         }
@@ -469,7 +478,7 @@ async fn handle_qrcode_rollcall(
 pub async fn process_rollcall_batch(
     api: Arc<ApiClient>,
     rollcalls: Vec<Rollcall>,
-    config: &AppConfig,
+    config: &AccountConfig,
     account_label: &str,
     line_bot: Option<&LineBotClient>,
     qr_rx: Option<QrCodeReceiver>,

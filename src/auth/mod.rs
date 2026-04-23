@@ -16,9 +16,9 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use reqwest::{cookie::Jar, Client, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
-use crate::config::AccountConfig;
+use crate::account::AccountConfig;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -77,14 +77,9 @@ impl AuthClient {
     }
 
     async fn authenticate(&self, account: &AccountConfig) -> Result<AuthSession> {
-        if account.use_manual_cookie() {
-            info!("使用手動 cookie 模式，跳過自動登入流程");
-            self.inject_manual_cookie(&account.manual_cookie).await
-        } else {
-            self.flow
-                .login(&self.client, &self.cookie_jar, &self.base_url, account)
-                .await
-        }
+        self.flow
+            .login(&self.client, &self.cookie_jar, &self.base_url, account)
+            .await
     }
 
     async fn inject_manual_cookie(&self, cookie_str: &str) -> Result<AuthSession> {
@@ -133,13 +128,6 @@ impl AuthClient {
         )
         .into_diagnostic()
         .wrap_err("Failed to rebuild HTTP client for re-auth")?;
-
-        if account.use_manual_cookie() {
-            warn!("使用手動 cookie 模式，無法自動重新認證");
-            return Err(miette::miette!(
-                "手動 cookie 已過期，請更新 accounts.toml 中對應帳號的 manual_cookie"
-            ));
-        }
 
         self.flow
             .login(&self.client, &self.cookie_jar, &self.base_url, account)

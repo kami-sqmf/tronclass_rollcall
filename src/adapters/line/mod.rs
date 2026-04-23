@@ -39,14 +39,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
+    Router,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hmac::{Hmac, Mac};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use reqwest::Client;
@@ -218,6 +218,11 @@ impl LineBotClient {
 
     /// 推送通知給管理員
     pub async fn push_message_to_admin(&self, text: &str) -> Result<()> {
+        if self.admin_user_id.is_empty() {
+            return Err(miette::miette!(
+                "admin_user_id 未設定，無法推送通知給管理員"
+            ));
+        }
         self.push_message(&self.admin_user_id.clone(), text).await
     }
 
@@ -254,11 +259,14 @@ impl std::fmt::Debug for LineBotClient {
 
 // ─── Axum 應用狀態 ────────────────────────────────────────────────────────────
 
-/// Webhook 伺服器的共享狀態
+/// 單一 Tronclass 帳號在 Line Webhook 中可操作的共享狀態
 #[derive(Clone)]
-pub struct WebhookState {
-    /// Line Bot 客戶端
-    pub bot: Arc<LineBotClient>,
+pub struct WebhookAccountState {
+    /// Tronclass Rollcall 內部帳號 ID
+    pub account_id: String,
+
+    /// 可查詢此帳號狀態的 Line User ID
+    pub line_user_id: String,
 
     /// QR code 輸入通道（傳送給 rollcall 模組）
     pub qr_tx: QrCodeSender,
@@ -276,20 +284,66 @@ pub struct WebhookState {
     pub reauth_tx: Arc<tokio::sync::Notify>,
 }
 
-impl WebhookState {
+impl WebhookAccountState {
     pub fn new(
-        bot: Arc<LineBotClient>,
+        account_id: impl Into<String>,
+        line_user_id: impl Into<String>,
         qr_tx: QrCodeSender,
         monitor_status: Arc<Mutex<MonitorStatus>>,
     ) -> Self {
         Self {
-            bot,
+            account_id: account_id.into(),
+            line_user_id: line_user_id.into(),
             qr_tx,
             monitor_status,
             is_running: Arc::new(Mutex::new(true)),
             force_poll_tx: Arc::new(tokio::sync::Notify::new()),
             reauth_tx: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+}
+
+/// Webhook 伺服器的共享狀態
+///
+/// 管理員可操作全部帳號；一般 Line 使用者只能查詢與自己
+/// `line_user_id` 綁定的帳號狀態。
+#[derive(Clone)]
+pub struct WebhookState {
+    /// Line Bot 客戶端
+    pub bot: Arc<LineBotClient>,
+
+    /// 所有可透過 Line Bot 查詢/控制的帳號狀態
+    pub accounts: Arc<Vec<WebhookAccountState>>,
+}
+
+impl WebhookState {
+    pub fn new(bot: Arc<LineBotClient>, accounts: Vec<WebhookAccountState>) -> Self {
+        Self {
+            bot,
+            accounts: Arc::new(accounts),
+        }
+    }
+
+    fn first_account(&self) -> Option<&WebhookAccountState> {
+        self.accounts.first()
+    }
+
+    fn account_for_line_user(&self, user_id: &str) -> Option<&WebhookAccountState> {
+        if user_id.is_empty() {
+            return None;
+        }
+
+        self.accounts
+            .iter()
+            .find(|account| !account.line_user_id.is_empty() && account.line_user_id == user_id)
+    }
+
+    fn is_admin_user(&self, user_id: &str) -> bool {
+        !self.bot.admin_user_id.is_empty() && user_id == self.bot.admin_user_id
+    }
+
+    fn admin_is_unrestricted(&self) -> bool {
+        self.bot.admin_user_id.is_empty()
     }
 }
 
@@ -407,30 +461,16 @@ async fn webhook_handler(
 async fn handle_event(event: &Event, state: &WebhookState) -> Result<()> {
     match event {
         Event::Message(msg_event) => {
-            // 只處理來自管理員的訊息（安全考量）
-            let user_id = msg_event.common.source.user_id().unwrap_or("");
-
-            if !state.bot.admin_user_id.is_empty()
-                && !user_id.is_empty()
-                && user_id != state.bot.admin_user_id
-            {
+            if !msg_event.common.source.is_user() {
                 debug!(
-                    user_id = %user_id,
-                    admin_id = %state.bot.admin_user_id,
-                    "忽略非管理員的訊息"
+                    source = ?msg_event.common.source,
+                    "忽略非個人對話來源的訊息事件"
                 );
-
-                // 可選：回覆非管理員「無法處理」
-                if let Some(reply_token) = msg_event.common.reply_token.as_deref() {
-                    let _ = state
-                        .bot
-                        .reply_text(reply_token, "⚠️ 抱歉，此 Bot 僅限授權使用者操作。")
-                        .await;
-                }
                 return Ok(());
             }
 
-            handle_message_event(msg_event, state).await?;
+            let user_id = msg_event.common.source.user_id().unwrap_or("");
+            handle_message_event(msg_event, state, user_id).await?;
         }
 
         Event::Follow(follow_event) => {
@@ -441,7 +481,7 @@ async fn handle_event(event: &Event, state: &WebhookState) -> Result<()> {
 
             if let Some(reply_token) = follow_event.common.reply_token.as_deref() {
                 let welcome = format!(
-                    "👋 歡迎使用 FJU Ghost Student！\n\n\
+                    "👋 歡迎使用 Tronclass Rollcall！\n\n\
                      我會自動幫你完成 Tronclass 簽到。\n\n\
                      {}",
                     BotCommand::help_text()
@@ -466,11 +506,20 @@ async fn handle_event(event: &Event, state: &WebhookState) -> Result<()> {
         }
 
         Event::Postback(pb_event) => {
+            if !pb_event.common.source.is_user() {
+                debug!(
+                    source = ?pb_event.common.source,
+                    "忽略非個人對話來源的 Postback 事件"
+                );
+                return Ok(());
+            }
+
             debug!(data = %pb_event.postback.data, "收到 Postback 事件");
             // 將 Postback data 當作指令處理
             let cmd = BotCommand::parse(&pb_event.postback.data);
             if let Some(reply_token) = pb_event.common.reply_token.as_deref() {
-                execute_command(cmd, reply_token, state).await?;
+                let user_id = pb_event.common.source.user_id().unwrap_or("");
+                execute_command(cmd, reply_token, state, user_id).await?;
             }
         }
 
@@ -487,7 +536,11 @@ async fn handle_event(event: &Event, state: &WebhookState) -> Result<()> {
 }
 
 /// 處理訊息事件
-async fn handle_message_event(event: &types::MessageEvent, state: &WebhookState) -> Result<()> {
+async fn handle_message_event(
+    event: &types::MessageEvent,
+    state: &WebhookState,
+    user_id: &str,
+) -> Result<()> {
     let message = &event.message;
     let reply_token = event.common.reply_token.as_deref().unwrap_or("");
 
@@ -499,7 +552,7 @@ async fn handle_message_event(event: &types::MessageEvent, state: &WebhookState)
             let cmd = BotCommand::parse(text);
             info!(command = %cmd, "解析指令");
 
-            execute_command(cmd, reply_token, state).await?;
+            execute_command(cmd, reply_token, state, user_id).await?;
         }
 
         LineMessage::Image(_) | LineMessage::Video(_) | LineMessage::Audio(_) => {
@@ -524,6 +577,11 @@ async fn handle_message_event(event: &types::MessageEvent, state: &WebhookState)
             }
         }
 
+        LineMessage::Sticker(_) => {
+            debug!("收到貼圖訊息，回覆目前狀態");
+            reply_current_status(reply_token, state, user_id).await?;
+        }
+
         _ => {
             debug!("收到其他類型訊息，忽略");
         }
@@ -536,24 +594,28 @@ async fn handle_message_event(event: &types::MessageEvent, state: &WebhookState)
 
 /// 執行解析出的 Bot 指令
 #[instrument(skip(reply_token, state), fields(command = %cmd))]
-async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookState) -> Result<()> {
+async fn execute_command(
+    cmd: BotCommand,
+    reply_token: &str,
+    state: &WebhookState,
+    user_id: &str,
+) -> Result<()> {
+    let is_admin = state.admin_is_unrestricted() || state.is_admin_user(user_id);
+
     match cmd {
         // ── /status ───────────────────────────────────────────────────────────
         BotCommand::Status => {
-            let status = state.monitor_status.lock().await;
-            let msg = status.to_line_message();
-            drop(status);
-
-            if !reply_token.is_empty() {
-                state.bot.reply_text(reply_token, &msg).await?;
-            }
+            reply_current_status(reply_token, state, user_id).await?;
         }
 
         // ── /stop ─────────────────────────────────────────────────────────────
         BotCommand::Stop => {
-            let mut running = state.is_running.lock().await;
-            *running = false;
-            drop(running);
+            if !is_admin {
+                reply_not_authorized(reply_token, state).await?;
+                return Ok(());
+            }
+
+            set_all_running(state, false).await;
 
             info!("收到 /stop 指令，暫停監控");
 
@@ -565,14 +627,17 @@ async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookStat
 
         // ── /start ────────────────────────────────────────────────────────────
         BotCommand::Start => {
-            let mut running = state.is_running.lock().await;
-            *running = true;
-            drop(running);
+            if !is_admin {
+                reply_not_authorized(reply_token, state).await?;
+                return Ok(());
+            }
+
+            set_all_running(state, true).await;
 
             info!("收到 /start 指令，恢復監控");
 
             // 立即觸發一次輪詢
-            state.force_poll_tx.notify_one();
+            notify_all_force_poll(state);
 
             let msg = "▶️ 簽到監控已恢復，立即執行一次簽到檢查...";
             if !reply_token.is_empty() {
@@ -582,10 +647,15 @@ async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookStat
 
         // ── /force ────────────────────────────────────────────────────────────
         BotCommand::ForceAttend => {
+            if !is_admin {
+                reply_not_authorized(reply_token, state).await?;
+                return Ok(());
+            }
+
             info!("收到 /force 指令，強制觸發一次簽到檢查");
 
             // 通知監控循環立即執行一次
-            state.force_poll_tx.notify_one();
+            notify_all_force_poll(state);
 
             let msg = "🔄 已觸發立即簽到檢查，請稍候...";
             if !reply_token.is_empty() {
@@ -595,9 +665,14 @@ async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookStat
 
         // ── /reauth ───────────────────────────────────────────────────────────
         BotCommand::ReAuth => {
+            if !is_admin {
+                reply_not_authorized(reply_token, state).await?;
+                return Ok(());
+            }
+
             info!("收到 /reauth 指令，觸發重新認證");
 
-            state.reauth_tx.notify_one();
+            notify_all_reauth(state);
 
             let msg = "🔐 已觸發重新認證，請稍候...";
             if !reply_token.is_empty() {
@@ -609,8 +684,30 @@ async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookStat
         BotCommand::QrCode(qr_data) => {
             info!(data_len = qr_data.len(), "收到 QR code 資料");
 
+            let account = if is_admin {
+                if state.accounts.len() == 1 {
+                    state.first_account()
+                } else {
+                    None
+                }
+            } else {
+                state.account_for_line_user(user_id)
+            };
+
+            let Some(account) = account else {
+                let msg = if is_admin {
+                    "⚠️ 多帳號模式下 QR Code 目標不明，請由綁定該帳號的 Line 使用者傳送 QR Code。"
+                } else {
+                    "⚠️ 找不到與你的 Line 帳號綁定的 Tronclass 帳號，無法傳送 QR Code。"
+                };
+                if !reply_token.is_empty() {
+                    state.bot.reply_text(reply_token, msg).await?;
+                }
+                return Ok(());
+            };
+
             // 傳送到簽到模組
-            match state.qr_tx.send(qr_data.clone()).await {
+            match account.qr_tx.send(qr_data.clone()).await {
                 Ok(_) => {
                     debug!("QR code 資料已傳送到簽到模組");
                     let msg = "✅ 已收到 QR Code，正在嘗試簽到，請稍候...";
@@ -659,6 +756,113 @@ async fn execute_command(cmd: BotCommand, reply_token: &str, state: &WebhookStat
 }
 
 // ─── 輔助函式 ─────────────────────────────────────────────────────────────────
+
+async fn reply_current_status(
+    reply_token: &str,
+    state: &WebhookState,
+    user_id: &str,
+) -> Result<()> {
+    if reply_token.is_empty() {
+        return Ok(());
+    }
+
+    let is_admin = state.admin_is_unrestricted() || state.is_admin_user(user_id);
+    let msg = status_message_for_user(state, user_id, is_admin).await;
+    state.bot.reply_text(reply_token, &msg).await?;
+    Ok(())
+}
+
+async fn status_message_for_user(state: &WebhookState, user_id: &str, is_admin: bool) -> String {
+    if is_admin {
+        return admin_status_message(state).await;
+    }
+
+    match state.account_for_line_user(user_id) {
+        Some(account) => {
+            let status = account.monitor_status.lock().await;
+            format!(
+                "📊 你的 Tronclass 帳號狀態\n帳號 ID：{}\n{}",
+                account.account_id,
+                status.to_line_message()
+            )
+        }
+        None => "⚠️ 找不到與你的 Line 帳號綁定的 Tronclass 帳號。請確認帳號資料中的 line_user_id 是否正確。"
+            .to_string(),
+    }
+}
+
+async fn admin_status_message(state: &WebhookState) -> String {
+    if state.accounts.is_empty() {
+        return "📊 系統狀態\n目前沒有可查詢的 Tronclass 帳號。".to_string();
+    }
+
+    if state.accounts.len() == 1 {
+        let account = &state.accounts[0];
+        let status = account.monitor_status.lock().await;
+        return status.to_line_message();
+    }
+
+    let mut lines = vec![format!("📊 系統狀態（{} 個帳號）", state.accounts.len())];
+    for account in state.accounts.iter() {
+        let status = account.monitor_status.lock().await;
+        let running = if status.is_running {
+            "運行中"
+        } else {
+            "已暫停"
+        };
+        let last_poll = status
+            .last_poll_timestamp
+            .map(|ts| format!("{ts}"))
+            .unwrap_or_else(|| "尚未輪詢".to_string());
+        let last_success = status.last_success_course.as_deref().unwrap_or("無");
+        lines.push(format!(
+            "\n帳號：{}\n使用者：{}\n狀態：{}\n最後輪詢：{}\n最後成功：{}\n連續失敗：{} 次",
+            account.account_id,
+            status.user_name,
+            running,
+            last_poll,
+            last_success,
+            status.consecutive_failures,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+async fn set_all_running(state: &WebhookState, is_running: bool) {
+    for account in state.accounts.iter() {
+        let mut running = account.is_running.lock().await;
+        *running = is_running;
+
+        let mut status = account.monitor_status.lock().await;
+        status.is_running = is_running;
+    }
+}
+
+fn notify_all_force_poll(state: &WebhookState) {
+    for account in state.accounts.iter() {
+        account.force_poll_tx.notify_one();
+    }
+}
+
+fn notify_all_reauth(state: &WebhookState) {
+    for account in state.accounts.iter() {
+        account.reauth_tx.notify_one();
+    }
+}
+
+async fn reply_not_authorized(reply_token: &str, state: &WebhookState) -> Result<()> {
+    if !reply_token.is_empty() {
+        state
+            .bot
+            .reply_text(
+                reply_token,
+                "⚠️ 你可以查詢自己的帳號狀態，但此操作僅限管理員使用。",
+            )
+            .await?;
+    }
+    Ok(())
+}
 
 /// 處理 Line API 回應
 ///
@@ -775,6 +979,36 @@ mod tests {
             channel_access_token: "test_token".to_string(),
             channel_secret: "test_channel_secret".to_string(),
             admin_user_id: "Uadmin123".to_string(),
+        }
+    }
+
+    fn make_test_status(user_name: &str, is_running: bool) -> Arc<Mutex<MonitorStatus>> {
+        Arc::new(Mutex::new(MonitorStatus {
+            is_running,
+            user_name: user_name.to_string(),
+            last_poll_timestamp: None,
+            last_success_course: None,
+            consecutive_failures: 0,
+            started_at: 0,
+        }))
+    }
+
+    fn make_test_account(
+        account_id: &str,
+        line_user_id: &str,
+        qr_tx: QrCodeSender,
+        status: Arc<Mutex<MonitorStatus>>,
+    ) -> WebhookAccountState {
+        WebhookAccountState::new(account_id, line_user_id, qr_tx, status)
+    }
+
+    fn make_test_event_common(source: types::EventSource) -> types::EventCommon {
+        types::EventCommon {
+            webhook_event_id: "test-event".to_string(),
+            reply_token: None,
+            timestamp: 0,
+            source,
+            delivery_context: types::DeliveryContext::default(),
         }
     }
 
@@ -924,17 +1158,11 @@ mod tests {
     async fn test_webhook_state_initial_is_running() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
 
-        let state = WebhookState::new(bot, qr_tx, status);
-        let is_running = state.is_running.lock().await;
+        let state = WebhookState::new(bot, vec![account]);
+        let is_running = state.accounts[0].is_running.lock().await;
         assert!(*is_running, "初始狀態應為運行中");
     }
 
@@ -942,24 +1170,18 @@ mod tests {
     async fn test_webhook_state_toggle_running() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
 
-        let state = WebhookState::new(bot, qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
 
         // 暫停
-        *state.is_running.lock().await = false;
-        assert!(!*state.is_running.lock().await);
+        *state.accounts[0].is_running.lock().await = false;
+        assert!(!*state.accounts[0].is_running.lock().await);
 
         // 恢復
-        *state.is_running.lock().await = true;
-        assert!(*state.is_running.lock().await);
+        *state.accounts[0].is_running.lock().await = true;
+        assert!(*state.accounts[0].is_running.lock().await);
     }
 
     // ── build_router ──────────────────────────────────────────────────────────
@@ -968,15 +1190,9 @@ mod tests {
     fn test_build_router_does_not_panic() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(tokio::sync::Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
-        let state = WebhookState::new(bot, qr_tx, status);
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
         // 確認 build_router 不會 panic
         let _router = build_router(state, "/webhook");
     }
@@ -987,20 +1203,14 @@ mod tests {
     async fn test_qrcode_command_sends_to_channel() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, mut qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
-        let state = WebhookState::new(bot, qr_tx, status);
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
 
         // 發送 QrCode 指令
         let cmd = BotCommand::QrCode("0~100!3~secret_data!4~42".to_string());
         // 不帶 reply_token（空字串），跳過 reply API 呼叫
-        let _ = execute_command(cmd, "", &state).await;
+        let _ = execute_command(cmd, "", &state, "Uadmin123").await;
 
         // 確認資料已傳送到通道
         let received = qr_rx.recv().await;
@@ -1011,17 +1221,10 @@ mod tests {
     async fn test_force_poll_command_notifies() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
-        let state = WebhookState::new(bot, qr_tx, status);
-
-        let notify = Arc::clone(&state.force_poll_tx);
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
+        let notify = Arc::clone(&account.force_poll_tx);
+        let state = WebhookState::new(bot, vec![account]);
 
         // 在背景等待通知
         let handle = tokio::spawn(async move {
@@ -1031,7 +1234,7 @@ mod tests {
         });
 
         // 執行 ForceAttend 指令
-        let _ = execute_command(BotCommand::ForceAttend, "", &state).await;
+        let _ = execute_command(BotCommand::ForceAttend, "", &state, "Uadmin123").await;
 
         let was_notified = handle.await.unwrap();
         assert!(was_notified, "ForceAttend 應觸發 notify");
@@ -1041,41 +1244,186 @@ mod tests {
     async fn test_stop_command_sets_not_running() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: true,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
-        let state = WebhookState::new(bot, qr_tx, status);
+        let status = make_test_status("test", true);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
 
         // 執行 Stop 指令
-        let _ = execute_command(BotCommand::Stop, "", &state).await;
-        assert!(!*state.is_running.lock().await, "Stop 後應為暫停狀態");
+        let _ = execute_command(BotCommand::Stop, "", &state, "Uadmin123").await;
+        assert!(
+            !*state.accounts[0].is_running.lock().await,
+            "Stop 後應為暫停狀態"
+        );
     }
 
     #[tokio::test]
     async fn test_start_command_sets_running() {
         let bot = Arc::new(make_test_bot_client());
         let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
-        let status = Arc::new(Mutex::new(MonitorStatus {
-            is_running: false,
-            user_name: "test".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 0,
-            started_at: 0,
-        }));
-        let state = WebhookState::new(bot, qr_tx, status);
+        let status = make_test_status("test", false);
+        let account = make_test_account("acc1", "Uuser1", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
 
         // 先停止
-        *state.is_running.lock().await = false;
+        *state.accounts[0].is_running.lock().await = false;
 
         // 執行 Start 指令
-        let _ = execute_command(BotCommand::Start, "", &state).await;
-        assert!(*state.is_running.lock().await, "Start 後應為運行狀態");
+        let _ = execute_command(BotCommand::Start, "", &state, "Uadmin123").await;
+        assert!(
+            *state.accounts[0].is_running.lock().await,
+            "Start 後應為運行狀態"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_can_read_own_account_status() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx_a, _qr_rx_a) = tokio::sync::mpsc::channel(10);
+        let (qr_tx_b, _qr_rx_b) = tokio::sync::mpsc::channel(10);
+        let status_a = make_test_status("Alice (acc-a)", true);
+        let status_b = make_test_status("Bob (acc-b)", true);
+        let account_a = make_test_account("acc-a", "Ualice", qr_tx_a, status_a);
+        let account_b = make_test_account("acc-b", "Ubob", qr_tx_b, status_b);
+        let state = WebhookState::new(bot, vec![account_a, account_b]);
+
+        let msg = status_message_for_user(&state, "Ualice", false).await;
+
+        assert!(msg.contains("acc-a"), "got: {msg}");
+        assert!(msg.contains("Alice"), "got: {msg}");
+        assert!(!msg.contains("acc-b"), "got: {msg}");
+        assert!(!msg.contains("Bob"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_without_bound_account_gets_not_found_message() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
+        let status = make_test_status("Alice (acc-a)", true);
+        let account = make_test_account("acc-a", "Ualice", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
+
+        let msg = status_message_for_user(&state, "Uunknown", false).await;
+
+        assert!(msg.contains("找不到"), "got: {msg}");
+        assert!(!msg.contains("Alice"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_admin_status_includes_all_accounts() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx_a, _qr_rx_a) = tokio::sync::mpsc::channel(10);
+        let (qr_tx_b, _qr_rx_b) = tokio::sync::mpsc::channel(10);
+        let status_a = make_test_status("Alice (acc-a)", true);
+        let status_b = make_test_status("Bob (acc-b)", false);
+        let account_a = make_test_account("acc-a", "Ualice", qr_tx_a, status_a);
+        let account_b = make_test_account("acc-b", "Ubob", qr_tx_b, status_b);
+        let state = WebhookState::new(bot, vec![account_a, account_b]);
+
+        let msg = status_message_for_user(&state, "Uadmin123", true).await;
+
+        assert!(msg.contains("2 個帳號"), "got: {msg}");
+        assert!(msg.contains("acc-a"), "got: {msg}");
+        assert!(msg.contains("acc-b"), "got: {msg}");
+        assert!(msg.contains("Bob"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_sticker_message_is_status_trigger_for_user_source() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
+        let status = make_test_status("Alice (acc-a)", true);
+        let account = make_test_account("acc-a", "Ualice", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
+        let event = types::MessageEvent {
+            common: make_test_event_common(types::EventSource::User {
+                user_id: "Ualice".to_string(),
+            }),
+            message: LineMessage::Sticker(types::StickerMessage {
+                id: "sticker-1".to_string(),
+                package_id: "1".to_string(),
+                sticker_id: "1".to_string(),
+                sticker_resource_type: None,
+            }),
+        };
+
+        handle_message_event(&event, &state, "Ualice")
+            .await
+            .unwrap();
+
+        let msg = status_message_for_user(&state, "Ualice", false).await;
+        assert!(msg.contains("acc-a"), "got: {msg}");
+        assert!(msg.contains("Alice"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_non_user_message_event_is_ignored() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
+        let status = make_test_status("Alice (acc-a)", true);
+        let account = make_test_account("acc-a", "Ualice", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
+        let event = Event::Message(types::MessageEvent {
+            common: make_test_event_common(types::EventSource::Group {
+                group_id: "Ggroup".to_string(),
+                user_id: Some("Uadmin123".to_string()),
+            }),
+            message: LineMessage::Text(types::TextMessage {
+                id: "text-1".to_string(),
+                text: "/stop".to_string(),
+                emojis: vec![],
+                mention: None,
+                quoted_message_id: None,
+            }),
+        });
+
+        handle_event(&event, &state).await.unwrap();
+
+        assert!(
+            *state.accounts[0].is_running.lock().await,
+            "群組來源即使帶有管理員 user_id，也不應執行指令"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_user_postback_event_is_ignored() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
+        let status = make_test_status("Alice (acc-a)", true);
+        let account = make_test_account("acc-a", "Ualice", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
+        let event = Event::Postback(types::PostbackEvent {
+            common: make_test_event_common(types::EventSource::Room {
+                room_id: "Rroom".to_string(),
+                user_id: Some("Uadmin123".to_string()),
+            }),
+            postback: types::PostbackData {
+                data: "/stop".to_string(),
+                params: None,
+            },
+        });
+
+        handle_event(&event, &state).await.unwrap();
+
+        assert!(
+            *state.accounts[0].is_running.lock().await,
+            "多人聊天室來源即使帶有管理員 user_id，也不應執行 postback 指令"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_control_command_is_ignored() {
+        let bot = Arc::new(make_test_bot_client());
+        let (qr_tx, _qr_rx) = tokio::sync::mpsc::channel(10);
+        let status = make_test_status("Alice (acc-a)", true);
+        let account = make_test_account("acc-a", "Ualice", qr_tx, status);
+        let state = WebhookState::new(bot, vec![account]);
+
+        let _ = execute_command(BotCommand::Stop, "", &state, "Ualice").await;
+
+        assert!(
+            *state.accounts[0].is_running.lock().await,
+            "非管理員不應能暫停監控"
+        );
     }
 
     // ── constant_time_compare_inner ───────────────────────────────────────────

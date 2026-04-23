@@ -1,12 +1,12 @@
 [package]
-name = "fju_ghost"
+name = "tronclass_rollcall"
 version = "0.1.0"
 edition = "2021"
-description = "FJU Ghost Student - Automated attendance system for Tronclass"
+description = "Tronclass Rollcall - Automated attendance system for Tronclass"
 authors = []
 
 [[bin]]
-name = "fju_ghost"
+name = "tronclass_rollcall"
 path = "src/main.rs"
 
 [dependencies]

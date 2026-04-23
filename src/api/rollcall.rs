@@ -241,6 +241,8 @@ pub enum AttendanceResult {
     Success,
     /// 雷達距離不足，附帶從原點到教室的距離
     RadarTooFar { distance: f64 },
+    /// 暫時性失敗（限流、逾時、伺服器錯誤等，可稍後重試）
+    TransientFailure { reason: String },
     /// 其他失敗（含錯誤訊息）
     Failed { reason: String },
 }
@@ -313,10 +315,24 @@ impl super::ApiClient {
                     reason: format!("code {number_code} 不正確"),
                 })
             }
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
+                let body_text = resp.text().await.unwrap_or_default();
+                warn!(status = %status, body = %body_text, "數字簽到遇到暫時性 HTTP 失敗");
+                Ok(AttendanceResult::TransientFailure {
+                    reason: format!("HTTP {status}: {body_text}"),
+                })
+            }
+            other if other.is_server_error() => {
+                let body_text = resp.text().await.unwrap_or_default();
+                warn!(status = %other, body = %body_text, "數字簽到遇到伺服器錯誤");
+                Ok(AttendanceResult::TransientFailure {
+                    reason: format!("HTTP {other}: {body_text}"),
+                })
+            }
             other => {
                 let body_text = resp.text().await.unwrap_or_default();
                 warn!(status = %other, body = %body_text, "數字簽到收到非預期狀態");
-                Ok(AttendanceResult::Failed {
+                Ok(AttendanceResult::TransientFailure {
                     reason: format!("HTTP {other}: {body_text}"),
                 })
             }
@@ -562,6 +578,10 @@ mod tests {
         assert!(!AttendanceResult::RadarTooFar { distance: 10.0 }.is_success());
         assert!(!AttendanceResult::Failed {
             reason: "err".into()
+        }
+        .is_success());
+        assert!(!AttendanceResult::TransientFailure {
+            reason: "HTTP 429 Too Many Requests".into()
         }
         .is_success());
     }

@@ -15,11 +15,11 @@ use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, info, instrument, warn};
 
-use crate::api::{rollcall::AttendanceResult, ApiClient};
+use crate::api::{is_auth_error, rollcall::AttendanceResult, ApiClient};
 use crate::config::BruteForceConfig;
 
 // ─── 爆破結果 ─────────────────────────────────────────────────────────────────
@@ -111,10 +111,18 @@ pub async fn brute_force_number_rollcall(
 ) -> BruteForceResult {
     let concurrency = config.concurrency;
     let delay_ms = config.request_delay_ms;
+    let mut current_concurrency = concurrency;
+    let mut cooldowns_used = 0usize;
+    let mut transient_failures_since_cooldown = 0usize;
 
     info!(
         rollcall_id = rollcall_id,
         concurrency = concurrency,
+        transient_failure_threshold = config.transient_failure_threshold,
+        transient_failure_ratio = config.transient_failure_ratio,
+        cooldown_secs = config.cooldown_secs,
+        max_cooldowns = config.max_cooldowns,
+        min_concurrency = config.min_concurrency,
         "開始數字爆破，並發數：{concurrency}"
     );
 
@@ -129,15 +137,10 @@ pub async fn brute_force_number_rollcall(
     // 已嘗試的計數器
     let attempts: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
-    // 用 semaphore 控制並發量
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut next_index = 0usize;
+    let mut chunk_idx = 0usize;
 
-    // 批次處理：將所有代碼分成多個批次，每批大小 = concurrency
-    let chunk_size = concurrency;
-    let chunks: Vec<&[String]> = all_codes.chunks(chunk_size).collect();
-    let num_chunks = chunks.len();
-
-    'outer: for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+    'outer: while next_index < total {
         // 在開始新批次前，先確認是否已找到答案或發生錯誤
         {
             let found_guard = found.lock().await;
@@ -147,9 +150,19 @@ pub async fn brute_force_number_rollcall(
             }
         }
 
+        let chunk_start = next_index;
+        let chunk_end = (chunk_start + current_concurrency).min(total);
+        let chunk = &all_codes[chunk_start..chunk_end];
+        next_index = chunk_end;
+        chunk_idx += 1;
+        let attempts_before_batch = *attempts.lock().await;
+        let batch_transient_failures: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
         debug!(
-            chunk = chunk_idx + 1,
-            total_chunks = num_chunks,
+            chunk = chunk_idx,
+            range_start = chunk_start,
+            range_end = chunk_end.saturating_sub(1),
+            concurrency = current_concurrency,
             codes = ?&chunk[..chunk.len().min(3)],
             "開始新批次"
         );
@@ -162,7 +175,7 @@ pub async fn brute_force_number_rollcall(
                 let found = Arc::clone(&found);
                 let fatal_error = Arc::clone(&fatal_error);
                 let attempts = Arc::clone(&attempts);
-                let semaphore = Arc::clone(&semaphore);
+                let batch_transient_failures = Arc::clone(&batch_transient_failures);
                 let code = code.clone();
 
                 async move {
@@ -177,9 +190,6 @@ pub async fn brute_force_number_rollcall(
                             return;
                         }
                     }
-
-                    // 取得 semaphore permit（控制並發）
-                    let _permit = semaphore.acquire().await.expect("Semaphore closed");
 
                     // 若有延遲設定
                     if delay_ms > 0 {
@@ -208,23 +218,30 @@ pub async fn brute_force_number_rollcall(
                             // 代碼錯誤，繼續
                             debug!(code = %code, "代碼錯誤，繼續");
                         }
+                        Ok(AttendanceResult::TransientFailure { reason }) => {
+                            let mut failures = batch_transient_failures.lock().await;
+                            *failures += 1;
+                            warn!(code = %code, reason = %reason, "數字簽到遇到暫時性失敗");
+                        }
                         Ok(AttendanceResult::RadarTooFar { .. }) => {
                             // 不應在數字簽到收到此回應，記錄警告
+                            let mut failures = batch_transient_failures.lock().await;
+                            *failures += 1;
                             warn!(code = %code, "收到非預期的 RadarTooFar 回應");
                         }
                         Err(e) => {
                             // 判斷是否為需要重新登錄的致命錯誤
                             let err_str = e.to_string();
-                            if err_str.contains("Unauthorized")
-                                || err_str.contains("401")
-                                || err_str.contains("403")
-                                || err_str.contains("Session")
-                            {
+                            if is_auth_error(&err_str) {
                                 warn!(error = %e, "數字爆破遇到認證錯誤，停止爆破");
                                 let mut fe = fatal_error.lock().await;
                                 if fe.is_none() {
                                     *fe = Some(err_str);
                                 }
+                            } else if is_transient_number_error(&err_str) {
+                                let mut failures = batch_transient_failures.lock().await;
+                                *failures += 1;
+                                warn!(code = %code, error = %e, "數字簽到遇到暫時性請求錯誤");
                             } else {
                                 // 其他錯誤（網路問題等），記錄但繼續
                                 debug!(code = %code, error = %e, "請求失敗，繼續");
@@ -238,28 +255,72 @@ pub async fn brute_force_number_rollcall(
         // 並發執行這批次的所有任務
         // 使用 buffer_unordered 保持並發，並等待所有任務完成
         stream::iter(tasks)
-            .for_each_concurrent(concurrency, |task| task)
+            .for_each_concurrent(current_concurrency, |task| task)
             .await;
 
         // 批次完成後記錄進度
         let current_attempts = *attempts.lock().await;
+        let batch_attempts = current_attempts.saturating_sub(attempts_before_batch);
+        let batch_transient = *batch_transient_failures.lock().await;
+        transient_failures_since_cooldown += batch_transient;
         let progress = BruteForceProgress::new(current_attempts, total);
         debug!(
-            chunk = chunk_idx + 1,
-            total_chunks = num_chunks,
+            chunk = chunk_idx,
             attempted = current_attempts,
+            batch_attempts = batch_attempts,
+            batch_transient_failures = batch_transient,
+            transient_failures_since_cooldown = transient_failures_since_cooldown,
             percent = format!("{:.1}%", progress.percent),
             "批次完成"
         );
 
         // 每完成一個批次就記錄一次進度日誌
-        if (chunk_idx + 1) % 10 == 0 {
+        if chunk_idx % 10 == 0 {
             info!(
                 progress = format!("{:.1}%", progress.percent),
                 attempted = current_attempts,
                 total = total,
+                concurrency = current_concurrency,
                 "爆破進度"
             );
+        }
+
+        if should_trigger_failure_control(
+            batch_transient,
+            batch_attempts,
+            transient_failures_since_cooldown,
+            config,
+        ) {
+            if cooldowns_used >= config.max_cooldowns {
+                let reason = format!(
+                    "異常失敗超過門檻，停止數字爆破（batch_transient={batch_transient}, \
+                     failures_since_cooldown={transient_failures_since_cooldown}, \
+                     cooldowns_used={cooldowns_used}）"
+                );
+                warn!(reason = %reason, "數字爆破中止");
+                let mut fe = fatal_error.lock().await;
+                if fe.is_none() {
+                    *fe = Some(reason);
+                }
+                break 'outer;
+            }
+
+            cooldowns_used += 1;
+            let next_concurrency =
+                next_cooldown_concurrency(current_concurrency, config.min_concurrency);
+            warn!(
+                cooldowns_used = cooldowns_used,
+                max_cooldowns = config.max_cooldowns,
+                cooldown_secs = config.cooldown_secs,
+                old_concurrency = current_concurrency,
+                new_concurrency = next_concurrency,
+                batch_transient_failures = batch_transient,
+                transient_failures_since_cooldown = transient_failures_since_cooldown,
+                "異常失敗達門檻，冷卻後降低並發"
+            );
+            sleep(Duration::from_secs(config.cooldown_secs)).await;
+            current_concurrency = next_concurrency;
+            transient_failures_since_cooldown = 0;
         }
     }
 
@@ -288,6 +349,44 @@ pub async fn brute_force_number_rollcall(
         );
         BruteForceResult::NotFound
     }
+}
+
+fn should_trigger_failure_control(
+    batch_transient_failures: usize,
+    batch_attempts: usize,
+    transient_failures_since_cooldown: usize,
+    config: &BruteForceConfig,
+) -> bool {
+    if batch_transient_failures == 0 {
+        return false;
+    }
+
+    let batch_ratio_exceeded = batch_attempts > 0
+        && (batch_transient_failures as f32 / batch_attempts as f32)
+            >= config.transient_failure_ratio;
+
+    batch_ratio_exceeded || transient_failures_since_cooldown >= config.transient_failure_threshold
+}
+
+fn next_cooldown_concurrency(current: usize, min_concurrency: usize) -> usize {
+    (current / 2).max(min_concurrency)
+}
+
+pub(crate) fn is_transient_number_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("429")
+        || lower.contains("too many requests")
+        || lower.contains("408")
+        || lower.contains("request timeout")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connect")
+        || lower.contains("connection")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("tcp")
+        || lower.contains("http 5")
+        || lower.contains("status 5")
 }
 
 // ─── 代碼生成器 ───────────────────────────────────────────────────────────────
@@ -444,6 +543,59 @@ mod tests {
     fn test_progress_zero_total() {
         let p = BruteForceProgress::new(0, 0);
         assert_eq!(p.percent, 0.0);
+    }
+
+    fn test_config() -> BruteForceConfig {
+        BruteForceConfig {
+            concurrency: 100,
+            request_delay_ms: 0,
+            transient_failure_threshold: 50,
+            transient_failure_ratio: 0.20,
+            cooldown_secs: 10,
+            max_cooldowns: 3,
+            min_concurrency: 10,
+        }
+    }
+
+    #[test]
+    fn test_transient_number_error_classification() {
+        assert!(is_transient_number_error("HTTP 429 Too Many Requests"));
+        assert!(is_transient_number_error("HTTP 408 Request Timeout"));
+        assert!(is_transient_number_error("HTTP 500 Internal Server Error"));
+        assert!(is_transient_number_error("operation timed out"));
+        assert!(is_transient_number_error("connection refused"));
+
+        assert!(!is_transient_number_error("code 0042 不正確"));
+        assert!(!is_transient_number_error("HTTP 400 Bad Request"));
+        assert!(!is_transient_number_error("HTTP 422 Unprocessable Entity"));
+        assert!(!is_transient_number_error("Unauthorized"));
+    }
+
+    #[test]
+    fn test_failure_control_ignores_normal_wrong_code_batches() {
+        let cfg = test_config();
+        assert!(!should_trigger_failure_control(0, 100, 0, &cfg));
+    }
+
+    #[test]
+    fn test_failure_control_triggers_on_batch_ratio() {
+        let cfg = test_config();
+        assert!(should_trigger_failure_control(20, 100, 20, &cfg));
+        assert!(!should_trigger_failure_control(19, 100, 19, &cfg));
+    }
+
+    #[test]
+    fn test_failure_control_triggers_on_threshold() {
+        let cfg = test_config();
+        assert!(should_trigger_failure_control(1, 100, 50, &cfg));
+        assert!(!should_trigger_failure_control(1, 100, 49, &cfg));
+    }
+
+    #[test]
+    fn test_next_cooldown_concurrency_halves_and_clamps() {
+        assert_eq!(next_cooldown_concurrency(100, 10), 50);
+        assert_eq!(next_cooldown_concurrency(15, 10), 10);
+        assert_eq!(next_cooldown_concurrency(10, 10), 10);
     }
 
     #[test]

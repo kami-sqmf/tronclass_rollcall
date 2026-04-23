@@ -5,7 +5,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use reqwest::{cookie::Jar, header, Client, Url};
 use tracing::{debug, info, warn};
 
-use crate::config::{AccountConfig, ProviderConfig};
+use crate::account::AccountConfig;
+use crate::config::ProviderConfig;
 
 use super::super::{
     build_cas_login_url, extract_captcha_url, extract_cas_error, extract_hidden_fields,
@@ -54,7 +55,11 @@ async fn solve_captcha(client: &Client, html: &str, base_url: &str) -> Result<St
         .ok_or_else(|| miette::miette!("FJU: 無法從登入頁找到驗證碼圖片"))?;
 
     // 取 base（去掉 query），後續每次重刷都換新 query
-    let captcha_base = captcha_url.split('?').next().unwrap_or(&captcha_url).to_string();
+    let captcha_base = captcha_url
+        .split('?')
+        .next()
+        .unwrap_or(&captcha_url)
+        .to_string();
 
     debug!(url = %captcha_base, "FJU: 下載驗證碼圖片");
 
@@ -118,10 +123,9 @@ impl AuthFlow for FjuAuthFlow {
                 .into_diagnostic()
                 .wrap_err("FJU: Failed to read login page")?;
 
-            let hidden =
-                extract_hidden_fields(&html, &["lt".to_string(), "execution".to_string()])
-                    .into_diagnostic()
-                    .wrap_err("FJU: 無法提取 hidden 欄位")?;
+            let hidden = extract_hidden_fields(&html, &["lt".to_string(), "execution".to_string()])
+                .into_diagnostic()
+                .wrap_err("FJU: 無法提取 hidden 欄位")?;
 
             debug!(fields = ?hidden.keys().collect::<Vec<_>>(), "FJU: 提取到 hidden fields");
 

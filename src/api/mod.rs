@@ -17,8 +17,6 @@ use reqwest::{
 };
 use thiserror::Error;
 
-use crate::config::AppConfig;
-
 // ─── 錯誤類型 ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -55,11 +53,6 @@ impl ApiClient {
             client,
             base_url: base_url.into(),
         }
-    }
-
-    /// 從設定和已認證的 client 建立 API 客戶端
-    pub fn from_config(client: Client, config: &AppConfig) -> Self {
-        Self::new(client, config.api.base_url.clone())
     }
 
     /// 通用回應處理：反序列化 JSON，遇到 401/403 轉換為 Unauthorized 錯誤

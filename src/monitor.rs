@@ -34,11 +34,12 @@ use miette::{Result, WrapErr};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::account::AccountConfig;
 use crate::adapters::line::types::MonitorStatus;
-use crate::adapters::line::{LineBotClient, WebhookState};
+use crate::adapters::line::{LineBotClient, WebhookAccountState};
 use crate::api::{is_auth_error, ApiClient};
 use crate::auth::AuthClient;
-use crate::config::{AccountConfig, AppConfig};
+use crate::config::AppConfig;
 use crate::rollcalls::{
     create_qrcode_channel, process_rollcall_batch, BatchSummary, QrCodeReceiver, QrCodeSender,
 };
@@ -62,8 +63,8 @@ pub struct MonitorContext {
     /// Line Bot 客戶端（可選）
     pub line_bot: Option<Arc<LineBotClient>>,
 
-    /// Webhook 伺服器狀態（用於接收控制指令）
-    pub webhook_state: Option<WebhookState>,
+    /// 此帳號在 Webhook 中可操作的共享狀態
+    pub webhook_account: Option<WebhookAccountState>,
 
     /// QR code 輸入通道接收端
     pub qr_rx: QrCodeReceiver,
@@ -121,11 +122,14 @@ impl MonitorContext {
             started_at,
         }));
 
-        // ── Webhook 狀態 ──────────────────────────────────────────────────────
-        let webhook_state = if interactive_line {
-            line_bot
-                .as_ref()
-                .map(|bot| WebhookState::new(Arc::clone(bot), qr_tx.clone(), Arc::clone(&status)))
+        // ── Webhook 帳號狀態 ──────────────────────────────────────────────────
+        let webhook_account = if interactive_line && line_bot.is_some() {
+            Some(WebhookAccountState::new(
+                account.id.clone(),
+                account.line_user_id.clone(),
+                qr_tx.clone(),
+                Arc::clone(&status),
+            ))
         } else {
             None
         };
@@ -136,7 +140,7 @@ impl MonitorContext {
             auth_client,
             api_client,
             line_bot,
-            webhook_state,
+            webhook_account,
             qr_rx,
             qr_tx,
             status,
@@ -161,7 +165,7 @@ impl MonitorContext {
 pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
     let config = Arc::clone(&ctx.global_config);
     let account_label = ctx.account.display_name().to_string();
-    let poll_interval = Duration::from_secs(config.api.poll_interval_secs);
+    let poll_interval = Duration::from_secs(ctx.account.provider_config.api.poll_interval_secs);
     let startup_delay = Duration::from_secs(config.monitor.startup_delay_secs);
 
     // ── 啟動延遲 ──────────────────────────────────────────────────────────────
@@ -173,14 +177,17 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
         tokio::time::sleep(startup_delay).await;
     }
 
-    // 取得控制訊號的參考（從 webhook_state）
+    // 取得控制訊號的參考（從 webhook_account）
     let force_poll_notify = ctx
-        .webhook_state
+        .webhook_account
         .as_ref()
         .map(|s| Arc::clone(&s.force_poll_tx));
-    let reauth_notify = ctx.webhook_state.as_ref().map(|s| Arc::clone(&s.reauth_tx));
+    let reauth_notify = ctx
+        .webhook_account
+        .as_ref()
+        .map(|s| Arc::clone(&s.reauth_tx));
     let is_running_lock = ctx
-        .webhook_state
+        .webhook_account
         .as_ref()
         .map(|s| Arc::clone(&s.is_running));
 
@@ -193,12 +200,12 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
             s.user_name.clone()
         };
         let startup_msg = format!(
-            "🚀 FJU Ghost Student 已啟動\n\
+            "🚀 Tronclass Rollcall 已啟動\n\
              帳號：{} / {user_name}\n\
              輪詢間隔：{} 秒\n\
              Line Bot：已啟用\n\n\
              輸入 /help 查看可用指令",
-            account_label, config.api.poll_interval_secs,
+            account_label, ctx.account.provider_config.api.poll_interval_secs,
         );
         if let Err(e) = bot.push_message_to_admin(&startup_msg).await {
             warn!(error = %e, "發送啟動通知失敗");
@@ -436,10 +443,10 @@ async fn do_poll_and_attend(ctx: &mut MonitorContext) -> Result<BatchSummary> {
     let outcomes = process_rollcall_batch(
         Arc::clone(&ctx.api_client),
         rollcalls,
-        &ctx.global_config,
+        &ctx.account,
         ctx.account.display_name(),
         line_bot_ref,
-        ctx.webhook_state.as_ref().map(|_| Arc::clone(&ctx.qr_rx)),
+        ctx.webhook_account.as_ref().map(|_| Arc::clone(&ctx.qr_rx)),
     )
     .await;
 
@@ -511,9 +518,9 @@ async fn do_reauth(ctx: &mut MonitorContext) -> Result<()> {
     info!(user_name = %session.user_name, "重新認證成功");
 
     // 重建 API 客戶端（使用新的 session cookie）
-    ctx.api_client = Arc::new(ApiClient::from_config(
+    ctx.api_client = Arc::new(ApiClient::new(
         ctx.auth_client.client.clone(),
-        &ctx.global_config,
+        ctx.account.base_url().to_string(),
     ));
 
     // 更新狀態中的 user_name

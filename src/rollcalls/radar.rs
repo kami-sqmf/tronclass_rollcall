@@ -612,6 +612,9 @@ async fn try_single_radar_coord(
     match result {
         AttendanceResult::Success => Ok(SingleRadarResult::Success),
         AttendanceResult::RadarTooFar { distance } => Ok(SingleRadarResult::TooFar { distance }),
+        AttendanceResult::TransientFailure { reason } => {
+            Ok(SingleRadarResult::OtherFailure { reason })
+        }
         AttendanceResult::Failed { reason } => Ok(SingleRadarResult::OtherFailure { reason }),
     }
 }

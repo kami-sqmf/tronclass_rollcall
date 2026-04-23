@@ -593,6 +593,10 @@ pub async fn attempt_qrcode_rollcall(
             warn!(reason = %reason, "QR Code 簽到失敗");
             QrCodeResult::Failed { reason }
         }
+        Ok(AttendanceResult::TransientFailure { reason }) => {
+            warn!(reason = %reason, "QR Code 簽到暫時性失敗");
+            QrCodeResult::Failed { reason }
+        }
         Ok(AttendanceResult::RadarTooFar { distance }) => {
             // QR Code 簽到不應收到此回應
             warn!(distance = distance, "QR Code 簽到收到非預期的 RadarTooFar");
