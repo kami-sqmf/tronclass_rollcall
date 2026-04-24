@@ -13,11 +13,14 @@ pub mod radar;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::account::AccountConfig;
-use crate::adapters::line::LineBotClient;
+use crate::adapters::events::{
+    AdapterMessenger, OutboundMessage, QrCodeRequest, RollcallEvent, RollcallResultEvent,
+};
+use crate::adapters::requests::{QrCodeReceiver, QrCodeSender};
+use crate::adapters::scanner::QrScannerRegistry;
 use crate::api::{
     is_auth_error,
     rollcall::{AttendanceType, Rollcall},
@@ -107,18 +110,6 @@ impl std::fmt::Display for RollcallResult {
     }
 }
 
-// ─── QR Code 通道 ─────────────────────────────────────────────────────────────
-
-/// 用於在 Line Bot handler 和 rollcall 邏輯之間傳遞 QR code 資料的通道類型
-pub type QrCodeSender = mpsc::Sender<String>;
-pub type QrCodeReceiver = Arc<Mutex<mpsc::Receiver<String>>>;
-
-/// 建立 QR code 通道
-pub fn create_qrcode_channel(buffer: usize) -> (QrCodeSender, QrCodeReceiver) {
-    let (tx, rx) = mpsc::channel(buffer);
-    (tx, Arc::new(Mutex::new(rx)))
-}
-
 // ─── 主調度函式 ───────────────────────────────────────────────────────────────
 
 /// 處理單個 rollcall 簽到
@@ -129,10 +120,10 @@ pub fn create_qrcode_channel(buffer: usize) -> (QrCodeSender, QrCodeReceiver) {
 /// - `api`：已認證的 API 客戶端（Arc 包裹，可跨任務共享）
 /// - `rollcall`：要處理的 rollcall
 /// - `config`：應用程式設定
-/// - `line_bot`：Line Bot 客戶端（用於發送通知和接收 QR code）
-/// - `qr_rx`：QR code 輸入通道接收端（等待使用者透過 Line Bot 傳送 QR code）
+/// - `messenger`：Adapter 訊息發送介面（用於發送通知）
+/// - `qr_rx`：QR code 輸入通道接收端（等待使用者透過 adapter 傳送 QR code）
 #[instrument(
-    skip(api, config, line_bot, qr_rx),
+    skip(api, config, messenger, qr_rx, qr_tx, scanner_registry),
     fields(
         rollcall_id = rollcall.rollcall_id,
         course = %rollcall.course_title,
@@ -144,8 +135,10 @@ pub async fn process_rollcall(
     rollcall: Rollcall,
     config: &AccountConfig,
     account_label: &str,
-    line_bot: Option<&LineBotClient>,
+    messenger: Option<&dyn AdapterMessenger>,
     qr_rx: Option<QrCodeReceiver>,
+    qr_tx: Option<QrCodeSender>,
+    scanner_registry: Option<Arc<QrScannerRegistry>>,
 ) -> RollcallOutcome {
     let start = std::time::Instant::now();
     let attendance_type = rollcall.attendance_type();
@@ -204,15 +197,15 @@ pub async fn process_rollcall(
     );
 
     // ── 發送開始通知 ──────────────────────────────────────────────────────────
-    if let Some(bot) = line_bot {
-        let msg = format!(
-            "📋 偵測到新簽到\n帳號：{}\n課程：{}\n教師：{}\n類型：{}\n開始自動簽到...",
-            account_label, rollcall.course_title, rollcall.created_by_name, attendance_type,
-        );
-        if let Err(e) = bot
-            .push_message_to_user_or_admin(&config.line_user_id, &msg)
-            .await
-        {
+    if let Some(bot) = messenger {
+        let msg = OutboundMessage::RollcallDetected(RollcallEvent {
+            rollcall_id: rollcall.rollcall_id,
+            account: account_label.to_string(),
+            course_name: rollcall.course_title.clone(),
+            teacher_name: rollcall.created_by_name.clone(),
+            attendance_type: attendance_type.to_string(),
+        });
+        if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
             warn!(error = %e, "發送 Line 開始通知失敗");
         }
     }
@@ -227,8 +220,10 @@ pub async fn process_rollcall(
                 &rollcall,
                 config,
                 account_label,
-                line_bot,
+                messenger,
                 qr_rx,
+                qr_tx,
+                scanner_registry,
             )
             .await
         }
@@ -237,16 +232,17 @@ pub async fn process_rollcall(
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     // ── 發送結果通知 ──────────────────────────────────────────────────────────
-    if let Some(bot) = line_bot {
-        let emoji = if result.is_success() { "✅" } else { "❌" };
-        let msg = format!(
-            "{emoji} 簽到結果\n帳號：{}\n課程：{}\n結果：{}\n耗時：{}ms",
-            account_label, rollcall.course_title, result, elapsed_ms,
-        );
-        if let Err(e) = bot
-            .push_message_to_user_or_admin(&config.line_user_id, &msg)
-            .await
-        {
+    if let Some(bot) = messenger {
+        let msg = OutboundMessage::RollcallFinished(RollcallResultEvent {
+            rollcall_id: rollcall.rollcall_id,
+            account: account_label.to_string(),
+            course_name: rollcall.course_title.clone(),
+            attendance_type: attendance_type.to_string(),
+            success: result.is_success(),
+            result: result.to_string(),
+            elapsed_ms,
+        });
+        if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
             warn!(error = %e, "發送 Line 結果通知失敗");
         }
     }
@@ -361,42 +357,68 @@ async fn handle_qrcode_rollcall(
     rollcall: &Rollcall,
     config: &AccountConfig,
     account_label: &str,
-    line_bot: Option<&LineBotClient>,
+    messenger: Option<&dyn AdapterMessenger>,
     qr_rx: Option<QrCodeReceiver>,
+    qr_tx: Option<QrCodeSender>,
+    scanner_registry: Option<Arc<QrScannerRegistry>>,
 ) -> RollcallResult {
     info!(rollcall_id = rollcall.rollcall_id, "開始 QR Code 簽到流程");
 
     // 構建掃碼頁面 URL（讓使用者點擊）
-    let scan_url = format!(
+    let legacy_scan_url = format!(
         "{}?rollcall_id={}",
         config.provider_config.qrcode.scanner_base_url, rollcall.rollcall_id
     );
+    let timeout = Duration::from_secs(config.provider_config.qrcode.scan_timeout_secs);
+    let scanner_registered = if let (Some(registry), Some(tx)) = (scanner_registry.as_ref(), qr_tx)
+    {
+        if registry.public_base_url().trim().is_empty() {
+            None
+        } else {
+            match registry
+                .register_pending(
+                    &config.provider,
+                    rollcall.rollcall_id,
+                    &config.id,
+                    tx,
+                    timeout,
+                )
+                .await
+            {
+                Ok(link) => Some((Arc::clone(registry), link.scan_url, link.already_submitted)),
+                Err(e) => {
+                    warn!(error = %e, "註冊 QR scanner 失敗，改用 legacy scanner URL");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let scan_url = scanner_registered
+        .as_ref()
+        .map(|(_, scan_url, _)| scan_url.clone())
+        .unwrap_or(legacy_scan_url);
+    let scanner_already_submitted = scanner_registered
+        .as_ref()
+        .map(|(_, _, already_submitted)| *already_submitted)
+        .unwrap_or(false);
 
     // 發送 Line 通知，要求使用者提供 QR code
-    if let Some(bot) = line_bot {
-        let msg = format!(
-            "📷 需要 QR Code 簽到\n\
-             課程：{}\n\
-             帳號：{}\n\
-             教師：{}\n\
-             \n\
-             請到以下連結掃描 QR Code，\n\
-             然後將掃描結果（URL）傳送到此對話：\n\
-             {}\n\
-             \n\
-             ⏰ 請在 {} 秒內回覆，否則簽到逾時",
-            rollcall.course_title,
-            account_label,
-            rollcall.created_by_name,
+    if let Some(bot) = messenger {
+        let msg = OutboundMessage::QrCodeRequested(QrCodeRequest {
+            rollcall_id: rollcall.rollcall_id,
+            account: account_label.to_string(),
+            course_name: rollcall.course_title.clone(),
+            teacher_name: rollcall.created_by_name.clone(),
             scan_url,
-            config.provider_config.qrcode.scan_timeout_secs,
-        );
+            timeout_secs: config.provider_config.qrcode.scan_timeout_secs,
+        });
 
-        if let Err(e) = bot
-            .push_message_to_user_or_admin(&config.line_user_id, &msg)
-            .await
-        {
-            warn!(error = %e, "發送 QR Code 請求通知失敗");
+        if !scanner_already_submitted {
+            if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
+                warn!(error = %e, "發送 QR Code 請求通知失敗");
+            }
         }
     } else {
         // 沒有 Line Bot，只能記錄日誌
@@ -405,6 +427,11 @@ async fn handle_qrcode_rollcall(
             scan_url = %scan_url,
             "QR Code 簽到需要 Line Bot 支援，但 Line Bot 未啟用！"
         );
+        if let Some((registry, _, _)) = scanner_registered.as_ref() {
+            registry
+                .unregister_pending(&config.provider, rollcall.rollcall_id, &config.id)
+                .await;
+        }
         return RollcallResult::Failed {
             reason: "QR Code 簽到需要 Line Bot，請在 config.toml 中啟用 line_bot".to_string(),
         };
@@ -413,12 +440,16 @@ async fn handle_qrcode_rollcall(
     // 等待 QR code 輸入（帶逾時）
     let Some(rx) = qr_rx else {
         error!("QR code 接收通道未初始化");
+        if let Some((registry, _, _)) = scanner_registered.as_ref() {
+            registry
+                .unregister_pending(&config.provider, rollcall.rollcall_id, &config.id)
+                .await;
+        }
         return RollcallResult::Failed {
             reason: "此部署模式未啟用 QR Code 回傳通道".to_string(),
         };
     };
 
-    let timeout = Duration::from_secs(config.provider_config.qrcode.scan_timeout_secs);
     info!(
         rollcall_id = rollcall.rollcall_id,
         timeout_secs = config.provider_config.qrcode.scan_timeout_secs,
@@ -434,6 +465,11 @@ async fn handle_qrcode_rollcall(
             }
             Ok(None) => {
                 // 通道已關閉
+                if let Some((registry, _, _)) = scanner_registered.as_ref() {
+                    registry
+                        .unregister_pending(&config.provider, rollcall.rollcall_id, &config.id)
+                        .await;
+                }
                 return RollcallResult::FatalError {
                     reason: "QR code 輸入通道已關閉".to_string(),
                 };
@@ -443,6 +479,11 @@ async fn handle_qrcode_rollcall(
                     rollcall_id = rollcall.rollcall_id,
                     "QR code 等待逾時（{}秒）", config.provider_config.qrcode.scan_timeout_secs
                 );
+                if let Some((registry, _, _)) = scanner_registered.as_ref() {
+                    registry
+                        .unregister_pending(&config.provider, rollcall.rollcall_id, &config.id)
+                        .await;
+                }
                 return RollcallResult::Failed {
                     reason: format!(
                         "QR code 輸入逾時（{}秒）",
@@ -452,6 +493,11 @@ async fn handle_qrcode_rollcall(
             }
         }
     };
+    if let Some((registry, _, _)) = scanner_registered.as_ref() {
+        registry
+            .unregister_pending(&config.provider, rollcall.rollcall_id, &config.id)
+            .await;
+    }
 
     // 執行 QR Code 簽到
     let result = attempt_qrcode_rollcall(api, rollcall.rollcall_id, &qr_input, false).await;
@@ -489,8 +535,10 @@ pub async fn process_rollcall_batch(
     rollcalls: Vec<Rollcall>,
     config: &AccountConfig,
     account_label: &str,
-    line_bot: Option<&LineBotClient>,
+    messenger: Option<&dyn AdapterMessenger>,
     qr_rx: Option<QrCodeReceiver>,
+    qr_tx: Option<QrCodeSender>,
+    scanner_registry: Option<Arc<QrScannerRegistry>>,
 ) -> Vec<RollcallOutcome> {
     let total = rollcalls.len();
     let mut outcomes = Vec::with_capacity(total);
@@ -535,8 +583,10 @@ pub async fn process_rollcall_batch(
             rollcall,
             config,
             account_label,
-            line_bot,
+            messenger,
             qr_rx.clone(),
+            qr_tx.clone(),
+            scanner_registry.clone(),
         )
         .await;
 
@@ -839,6 +889,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_send_recv() {
+        use crate::adapters::requests::create_qrcode_channel;
+
         let (tx, rx) = create_qrcode_channel(1);
         tx.send("test_qr_data".to_string()).await.unwrap();
 
@@ -849,6 +901,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_timeout() {
+        use crate::adapters::requests::create_qrcode_channel;
+
         let (_tx, rx) = create_qrcode_channel(1);
         let mut rx_guard = rx.lock().await;
         let result = tokio::time::timeout(Duration::from_millis(50), rx_guard.recv()).await;

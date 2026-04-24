@@ -6,6 +6,12 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [0.1.1] - 2026-04-24
 
+### Added
+
+- Added a shared local QR scanner flow for Line Bot deployments so one QR scan can fan out to every account waiting on the same provider and rollcall ID.
+- Added `[adapters.line_bot].public_base_url` for externally reachable scanner callback URLs served by the existing webhook server.
+- Added scanner routes and a browser scanner page with camera scanning and manual QR payload fallback.
+
 ### Fixed
 
 - Added configurable runtime timezone support through `[time].timezone` so scheduled polling follows the intended local timezone instead of the host default.
