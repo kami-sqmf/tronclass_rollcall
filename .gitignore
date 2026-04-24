@@ -3,3 +3,4 @@ accounts.toml
 config.toml
 .DS_Store
 config/accounts.db
+.claude/**
