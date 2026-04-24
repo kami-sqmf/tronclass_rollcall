@@ -35,6 +35,10 @@ min_concurrency = 10
 scanner_base_url = "https://elearn2.fju.edu.tw/scanner-jumper"
 scan_timeout_secs = 60
 
+[providers.fju.schedule]
+periods = ["07:10~17:30"]
+rest_weekdays = ["sun"]
+
 # ─── Adapter 設定 ────────────────────────────────────────────────────────────
 
 [adapters.line_bot]

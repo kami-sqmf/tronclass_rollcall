@@ -218,12 +218,17 @@ impl LineBotClient {
 
     /// 推送通知給管理員
     pub async fn push_message_to_admin(&self, text: &str) -> Result<()> {
-        if self.admin_user_id.is_empty() {
-            return Err(miette::miette!(
-                "admin_user_id 未設定，無法推送通知給管理員"
-            ));
-        }
-        self.push_message(&self.admin_user_id.clone(), text).await
+        self.push_message_to_user_or_admin("", text).await
+    }
+
+    /// 推送通知給綁定使用者；若未綁定則退回管理員
+    pub async fn push_message_to_user_or_admin(
+        &self,
+        line_user_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let to = self.notification_target_user_id(line_user_id)?;
+        self.push_message(to, text).await
     }
 
     /// 內部：執行 Push API 呼叫
@@ -244,6 +249,20 @@ impl LineBotClient {
     /// 取得管理員 User ID
     pub fn admin_user_id(&self) -> &str {
         &self.admin_user_id
+    }
+
+    fn notification_target_user_id<'a>(&'a self, line_user_id: &'a str) -> Result<&'a str> {
+        if !line_user_id.is_empty() {
+            return Ok(line_user_id);
+        }
+
+        if !self.admin_user_id.is_empty() {
+            return Ok(self.admin_user_id.as_str());
+        }
+
+        Err(miette::miette!(
+            "line_user_id 與 admin_user_id 均未設定，無法推送通知"
+        ))
     }
 }
 
@@ -1150,6 +1169,33 @@ mod tests {
         // token 和 secret 不應洩漏
         assert!(!debug_str.contains("test_token"));
         assert!(!debug_str.contains("test_channel_secret"));
+    }
+
+    #[test]
+    fn test_notification_target_prefers_bound_user() {
+        let bot = make_test_bot_client();
+        let target = bot.notification_target_user_id("Ubound456").unwrap();
+        assert_eq!(target, "Ubound456");
+    }
+
+    #[test]
+    fn test_notification_target_falls_back_to_admin() {
+        let bot = make_test_bot_client();
+        let target = bot.notification_target_user_id("").unwrap();
+        assert_eq!(target, "Uadmin123");
+    }
+
+    #[test]
+    fn test_notification_target_requires_any_available_user() {
+        let bot = LineBotClient {
+            http: Client::new(),
+            channel_access_token: "test_token".to_string(),
+            channel_secret: "test_channel_secret".to_string(),
+            admin_user_id: String::new(),
+        };
+
+        let err = bot.notification_target_user_id("").unwrap_err();
+        assert!(err.to_string().contains("無法推送通知"));
     }
 
     // ── WebhookState ──────────────────────────────────────────────────────────

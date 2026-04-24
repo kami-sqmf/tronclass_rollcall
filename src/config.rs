@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use chrono::{NaiveTime, Weekday};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,9 @@ pub struct ProviderConfig {
     pub brute_force: BruteForceConfig,
     /// QR Code 設定
     pub qrcode: QrCodeConfig,
+    /// 課堂時段與輪詢時間設定
+    #[serde(default)]
+    pub schedule: PollingScheduleConfig,
 }
 
 impl Default for ProviderConfig {
@@ -91,6 +95,18 @@ impl Default for ProviderConfig {
                 scanner_base_url: default_scanner_base_url(),
                 scan_timeout_secs: default_scan_timeout(),
             },
+            schedule: PollingScheduleConfig::default(),
+        }
+    }
+}
+
+impl ProviderConfig {
+    fn apply_kind_defaults(&mut self) {
+        if self.schedule.periods.is_empty() && matches!(self.kind, ProviderKind::FJU) {
+            self.schedule.periods = default_fju_schedule_periods();
+        }
+        if self.schedule.rest_weekdays.is_empty() && matches!(self.kind, ProviderKind::FJU) {
+            self.schedule.rest_weekdays = vec![ScheduleWeekday::Sun];
         }
     }
 }
@@ -177,6 +193,55 @@ pub struct QrCodeConfig {
 
     #[serde(default = "default_scan_timeout")]
     pub scan_timeout_secs: u64,
+}
+
+/// Provider 輪詢時段設定
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PollingScheduleConfig {
+    /// 允許輪詢的課堂時段
+    #[serde(default)]
+    pub periods: Vec<String>,
+    /// 休息日；這些星期不會進行自動輪詢
+    #[serde(default)]
+    pub rest_weekdays: Vec<ScheduleWeekday>,
+}
+
+impl PollingScheduleConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.periods.is_empty()
+    }
+
+    pub fn is_rest_day(&self, weekday: Weekday) -> bool {
+        self.rest_weekdays.iter().any(|day| day.matches(weekday))
+    }
+}
+
+/// 星期設定（用於課表休息日）
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleWeekday {
+    Mon,
+    Tue,
+    Wed,
+    Thu,
+    Fri,
+    Sat,
+    Sun,
+}
+
+impl ScheduleWeekday {
+    pub fn matches(self, weekday: Weekday) -> bool {
+        matches!(
+            (self, weekday),
+            (ScheduleWeekday::Mon, Weekday::Mon)
+                | (ScheduleWeekday::Tue, Weekday::Tue)
+                | (ScheduleWeekday::Wed, Weekday::Wed)
+                | (ScheduleWeekday::Thu, Weekday::Thu)
+                | (ScheduleWeekday::Fri, Weekday::Fri)
+                | (ScheduleWeekday::Sat, Weekday::Sat)
+                | (ScheduleWeekday::Sun, Weekday::Sun)
+        )
+    }
 }
 
 // ======== Adapter ========
@@ -290,6 +355,9 @@ fn default_scanner_base_url() -> String {
 fn default_scan_timeout() -> u64 {
     60
 }
+fn default_fju_schedule_periods() -> Vec<String> {
+    vec!["07:10~17:30".to_string()]
+}
 fn default_webhook_port() -> u16 {
     8080
 }
@@ -332,9 +400,16 @@ impl AppConfig {
             .into_diagnostic()
             .wrap_err_with(|| format!("Failed to load config from `{}`", path.display()))?;
 
-        cfg.try_deserialize::<AppConfig>()
+        let mut app = cfg
+            .try_deserialize::<AppConfig>()
             .into_diagnostic()
-            .wrap_err("Failed to deserialize config")
+            .wrap_err("Failed to deserialize config")?;
+
+        for provider in app.providers.values_mut() {
+            provider.apply_kind_defaults();
+        }
+
+        Ok(app)
     }
 
     pub fn load_default() -> Result<Self> {
@@ -360,6 +435,7 @@ impl AppConfig {
                     "providers.{name}.api.request_timeout_secs 必須大於 0"
                 ));
             }
+            validate_provider_schedule(name, &p.schedule)?;
             if p.brute_force.concurrency == 0 {
                 return Err(miette::miette!(
                     "providers.{name}.brute_force.concurrency 必須大於 0"
@@ -447,6 +523,85 @@ impl std::fmt::Display for AppConfig {
             self.adapters.line_bot.enabled,
         )
     }
+}
+
+pub(crate) fn parse_hhmm(value: &str) -> Result<NaiveTime> {
+    let (hour_str, minute_str) = value
+        .split_once(':')
+        .ok_or_else(|| miette::miette!("時間格式必須為 HH:MM，收到 `{value}`"))?;
+    let hour: u32 = hour_str
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("無法解析小時：`{value}`"))?;
+    let minute: u32 = minute_str
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("無法解析分鐘：`{value}`"))?;
+
+    NaiveTime::from_hms_opt(hour, minute, 0)
+        .ok_or_else(|| miette::miette!("時間 `{value}` 超出有效範圍"))
+}
+
+pub(crate) fn parse_schedule_period(period: &str) -> Result<(NaiveTime, NaiveTime)> {
+    let (start, end) = period
+        .split_once('~')
+        .ok_or_else(|| miette::miette!("時段格式必須為 HH:MM~HH:MM，收到 `{period}`"))?;
+    let start = parse_hhmm(start.trim())?;
+    let end = parse_hhmm(end.trim())?;
+
+    if start >= end {
+        return Err(miette::miette!(
+            "時段 `{period}` 的開始時間必須早於結束時間"
+        ));
+    }
+
+    Ok((start, end))
+}
+
+fn validate_provider_schedule(name: &str, schedule: &PollingScheduleConfig) -> Result<()> {
+    let mut parsed = Vec::with_capacity(schedule.periods.len());
+    let mut periods = std::collections::BTreeSet::new();
+    let mut rest_weekdays = std::collections::BTreeSet::new();
+
+    for weekday in &schedule.rest_weekdays {
+        if !rest_weekdays.insert(*weekday) {
+            return Err(miette::miette!(
+                "providers.{name}.schedule.rest_weekdays 中有重複的星期設定"
+            ));
+        }
+    }
+
+    for (i, period) in schedule.periods.iter().enumerate() {
+        if period.trim().is_empty() {
+            return Err(miette::miette!(
+                "providers.{name}.schedule.periods[{i}] 不可為空"
+            ));
+        }
+
+        if !periods.insert(period.clone()) {
+            return Err(miette::miette!(
+                "providers.{name}.schedule.periods 中的 `{period}` 重複"
+            ));
+        }
+
+        let (start, end) = parse_schedule_period(period)
+            .wrap_err_with(|| format!("providers.{name}.schedule.periods[{i}] 格式錯誤"))?;
+
+        parsed.push((start, end, period.clone()));
+    }
+
+    parsed.sort_by_key(|(start, _, _)| *start);
+    for pair in parsed.windows(2) {
+        let (_, prev_end, prev_label) = &pair[0];
+        let (next_start, _, next_label) = &pair[1];
+        if next_start < prev_end {
+            return Err(miette::miette!(
+                "providers.{name}.schedule.periods 中的 `{prev_label}` 與 `{next_label}` 時段重疊"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ─── 測試 ─────────────────────────────────────────────────────────────────────
@@ -546,6 +701,8 @@ mod tests {
         assert_eq!(p.brute_force.min_concurrency, 10);
         assert_eq!(p.qrcode.scan_timeout_secs, 60);
         assert!(!p.qrcode.scanner_base_url.is_empty());
+        assert!(p.schedule.periods.is_empty());
+        assert!(p.schedule.rest_weekdays.is_empty());
     }
 
     #[test]
@@ -631,6 +788,26 @@ scan_timeout_secs = 30
         assert_eq!(p.radar.accuracy, 50);
         assert_eq!(p.brute_force.concurrency, 100);
         assert_eq!(p.qrcode.scan_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_fju_kind_applies_default_schedule_and_sunday_rest() {
+        let toml = r#"
+[logging]
+[monitor]
+
+[providers.fju]
+kind = "fju"
+[providers.fju.api]
+[providers.fju.radar]
+[providers.fju.brute_force]
+[providers.fju.qrcode]
+"#;
+        let f = write_toml(toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let p = &cfg.providers["fju"];
+        assert_eq!(p.schedule.periods, vec!["07:10~17:30".to_string()]);
+        assert!(p.schedule.rest_weekdays.contains(&ScheduleWeekday::Sun));
     }
 
     #[test]
@@ -852,6 +1029,44 @@ scanner_base_url = "https://example.com/scanner"
         let cfg = AppConfig::load(f.path()).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("緯度"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_fails_for_invalid_schedule_overlap() {
+        let toml = r#"
+[logging]
+[monitor]
+[providers.p]
+[providers.p.api]
+[providers.p.radar]
+[providers.p.brute_force]
+[providers.p.qrcode]
+[providers.p.schedule]
+periods = ["08:10~09:00", "08:50~09:30"]
+"#;
+        let f = write_toml(toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("重疊"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_fails_for_duplicate_rest_weekdays() {
+        let toml = r#"
+[logging]
+[monitor]
+[providers.p]
+[providers.p.api]
+[providers.p.radar]
+[providers.p.brute_force]
+[providers.p.qrcode]
+[providers.p.schedule]
+rest_weekdays = ["sun", "sun"]
+"#;
+        let f = write_toml(toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("rest_weekdays"), "got: {err}");
     }
 
     #[test]

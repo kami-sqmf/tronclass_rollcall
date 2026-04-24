@@ -209,7 +209,10 @@ pub async fn process_rollcall(
             "📋 偵測到新簽到\n帳號：{}\n課程：{}\n教師：{}\n類型：{}\n開始自動簽到...",
             account_label, rollcall.course_title, rollcall.created_by_name, attendance_type,
         );
-        if let Err(e) = bot.push_message_to_admin(&msg).await {
+        if let Err(e) = bot
+            .push_message_to_user_or_admin(&config.line_user_id, &msg)
+            .await
+        {
             warn!(error = %e, "發送 Line 開始通知失敗");
         }
     }
@@ -240,7 +243,10 @@ pub async fn process_rollcall(
             "{emoji} 簽到結果\n帳號：{}\n課程：{}\n結果：{}\n耗時：{}ms",
             account_label, rollcall.course_title, result, elapsed_ms,
         );
-        if let Err(e) = bot.push_message_to_admin(&msg).await {
+        if let Err(e) = bot
+            .push_message_to_user_or_admin(&config.line_user_id, &msg)
+            .await
+        {
             warn!(error = %e, "發送 Line 結果通知失敗");
         }
     }
@@ -346,8 +352,8 @@ async fn handle_radar_rollcall(
 /// 處理 QR Code 簽到
 ///
 /// 流程：
-/// 1. 透過 Line Bot 發送掃碼請求給管理員
-/// 2. 等待管理員透過 Line Bot 回傳 QR code URL（或 p 參數）
+/// 1. 透過 Line Bot 發送掃碼請求給該帳號綁定使用者（若未綁定則退回管理員）
+/// 2. 等待使用者透過 Line Bot 回傳 QR code URL（或 p 參數）
 /// 3. 解析並呼叫 API 完成簽到
 /// 4. 若超時（`config.provider_config.qrcode.scan_timeout_secs`），返回失敗
 async fn handle_qrcode_rollcall(
@@ -386,7 +392,10 @@ async fn handle_qrcode_rollcall(
             config.provider_config.qrcode.scan_timeout_secs,
         );
 
-        if let Err(e) = bot.push_message_to_admin(&msg).await {
+        if let Err(e) = bot
+            .push_message_to_user_or_admin(&config.line_user_id, &msg)
+            .await
+        {
             warn!(error = %e, "發送 QR Code 請求通知失敗");
         }
     } else {

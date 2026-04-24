@@ -1,6 +1,6 @@
 [package]
 name = "tronclass_rollcall"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Tronclass Rollcall - Automated attendance system for Tronclass"
 authors = []

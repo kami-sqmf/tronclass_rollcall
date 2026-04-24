@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently uses pre-1.0 versioning.
 
-## [Unreleased]
+## [0.1.1] - 2026-04-24
 
 ### Added
 
@@ -13,6 +13,8 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 - Allowed non-admin Line users with matching `line_user_id` bindings to query their own Tronclass account status with `/status`.
 - Allowed Line users to send a sticker to receive the same current status response as `/status`.
 - Ignored Line message and postback events from group or room sources so commands only run in one-on-one user conversations.
+- Routed account-related Line push notifications to the bound account `line_user_id` first, falling back to the admin user only when no binding is configured.
+- Added provider-level polling schedules with simple `HH:MM~HH:MM` time ranges and Sunday rest support; FJU now defaults to `07:10~17:30` with Sunday off.
 
 ## [0.1.0] - 2026-04-23
 

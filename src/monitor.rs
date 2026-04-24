@@ -30,6 +30,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{Datelike, Local, NaiveTime, Timelike, Weekday};
 use miette::{Result, WrapErr};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
@@ -39,7 +40,7 @@ use crate::adapters::line::types::MonitorStatus;
 use crate::adapters::line::{LineBotClient, WebhookAccountState};
 use crate::api::{is_auth_error, ApiClient};
 use crate::auth::AuthClient;
-use crate::config::AppConfig;
+use crate::config::{parse_schedule_period, AppConfig, PollingScheduleConfig};
 use crate::rollcalls::{
     create_qrcode_channel, process_rollcall_batch, BatchSummary, QrCodeReceiver, QrCodeSender,
 };
@@ -190,10 +191,11 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
         .webhook_account
         .as_ref()
         .map(|s| Arc::clone(&s.is_running));
+    let schedule = ctx.account.provider_config.schedule.clone();
 
     info!(account = %account_label, "🚀 開始主監控循環");
 
-    // 傳送啟動通知給管理員
+    // 傳送啟動通知給該帳號綁定使用者（若未綁定則退回管理員）
     if let Some(bot) = &ctx.line_bot {
         let user_name = {
             let s = ctx.status.lock().await;
@@ -207,7 +209,10 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
              輸入 /help 查看可用指令",
             account_label, ctx.account.provider_config.api.poll_interval_secs,
         );
-        if let Err(e) = bot.push_message_to_admin(&startup_msg).await {
+        if let Err(e) = bot
+            .push_message_to_user_or_admin(&ctx.account.line_user_id, &startup_msg)
+            .await
+        {
             warn!(error = %e, "發送啟動通知失敗");
         }
     }
@@ -219,12 +224,20 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
     loop {
         // ── 等待觸發（定時 or 強制） ──────────────────────────────────────────
         let triggered_by_force =
-            wait_for_trigger(poll_interval, force_poll_notify.as_deref()).await;
+            wait_for_trigger(poll_interval, force_poll_notify.as_deref(), &schedule).await;
 
         if triggered_by_force {
             debug!("由強制觸發啟動本次輪詢");
         } else {
             debug!("由定時觸發啟動本次輪詢");
+        }
+
+        if !triggered_by_force {
+            let now = Local::now();
+            if !is_within_poll_window(&schedule, now.weekday(), now.time()) {
+                debug!("目前不在課堂輪詢時段內，略過本次定時觸發");
+                continue;
+            }
         }
 
         // ── 檢查是否暫停 ──────────────────────────────────────────────────────
@@ -246,20 +259,20 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                     error!(error = %e, "重新認證失敗");
                     if let Some(bot) = &ctx.line_bot {
                         let _ = bot
-                            .push_message_to_admin(&format!(
-                                "❌ [{}] 重新認證失敗：{e}",
-                                account_label
-                            ))
+                            .push_message_to_user_or_admin(
+                                &ctx.account.line_user_id,
+                                &format!("❌ [{}] 重新認證失敗：{e}", account_label),
+                            )
                             .await;
                     }
                 } else {
                     consecutive_failures = 0;
                     if let Some(bot) = &ctx.line_bot {
                         let _ = bot
-                            .push_message_to_admin(&format!(
-                                "✅ [{}] 重新認證成功！",
-                                account_label
-                            ))
+                            .push_message_to_user_or_admin(
+                                &ctx.account.line_user_id,
+                                &format!("✅ [{}] 重新認證成功！", account_label),
+                            )
                             .await;
                     }
                 }
@@ -326,10 +339,13 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
 
                     if let Some(bot) = &ctx.line_bot {
                         let _ = bot
-                            .push_message_to_admin(&format!(
-                                "⚠️ [{}] 簽到監控遇到錯誤，嘗試重新認證...\n錯誤：{e}",
-                                account_label
-                            ))
+                            .push_message_to_user_or_admin(
+                                &ctx.account.line_user_id,
+                                &format!(
+                                    "⚠️ [{}] 簽到監控遇到錯誤，嘗試重新認證...\n錯誤：{e}",
+                                    account_label
+                                ),
+                            )
                             .await;
                     }
 
@@ -343,10 +359,10 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                             }
                             if let Some(bot) = &ctx.line_bot {
                                 let _ = bot
-                                    .push_message_to_admin(&format!(
-                                        "✅ [{}] 自動重新認證成功！",
-                                        account_label
-                                    ))
+                                    .push_message_to_user_or_admin(
+                                        &ctx.account.line_user_id,
+                                        &format!("✅ [{}] 自動重新認證成功！", account_label),
+                                    )
                                     .await;
                             }
                         }
@@ -354,12 +370,15 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                             error!(error = %reauth_err, "重新認證失敗！");
                             if let Some(bot) = &ctx.line_bot {
                                 let _ = bot
-                                    .push_message_to_admin(&format!(
-                                        "❌ [{}] 自動重新認證失敗：{reauth_err}\n\n\
+                                    .push_message_to_user_or_admin(
+                                        &ctx.account.line_user_id,
+                                        &format!(
+                                            "❌ [{}] 自動重新認證失敗：{reauth_err}\n\n\
                                          請手動更新 accounts.toml 中對應帳號的 manual_cookie，\n\
                                          或輸入 /reauth 再次嘗試。",
-                                        account_label
-                                    ))
+                                            account_label
+                                        ),
+                                    )
                                     .await;
                             }
 
@@ -546,7 +565,31 @@ async fn do_reauth(ctx: &mut MonitorContext) -> Result<()> {
 async fn wait_for_trigger(
     poll_interval: Duration,
     force_poll_notify: Option<&tokio::sync::Notify>,
+    schedule: &PollingScheduleConfig,
 ) -> bool {
+    if let Some(next_window) =
+        next_poll_window(schedule, Local::now().weekday(), Local::now().time())
+    {
+        info!(
+            next_label = %next_window.label,
+            wait_secs = next_window.wait.as_secs(),
+            "目前不在課堂時段內，等待下一個輪詢時段"
+        );
+
+        return match force_poll_notify {
+            Some(notify) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(next_window.wait) => false,
+                    _ = notify.notified() => true,
+                }
+            }
+            None => {
+                tokio::time::sleep(next_window.wait).await;
+                false
+            }
+        };
+    }
+
     match force_poll_notify {
         Some(notify) => {
             // 同時等待定時器和強制通知
@@ -561,6 +604,99 @@ async fn wait_for_trigger(
             false
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NextPollWindow {
+    label: String,
+    wait: Duration,
+}
+
+fn is_within_poll_window(
+    schedule: &PollingScheduleConfig,
+    weekday: Weekday,
+    now: NaiveTime,
+) -> bool {
+    if !schedule.is_configured() {
+        return true;
+    }
+    if schedule.is_rest_day(weekday) {
+        return false;
+    }
+
+    parsed_schedule_periods(schedule)
+        .into_iter()
+        .any(|(start, end)| now >= start && now < end)
+}
+
+fn next_poll_window(
+    schedule: &PollingScheduleConfig,
+    weekday: Weekday,
+    now: NaiveTime,
+) -> Option<NextPollWindow> {
+    if !schedule.is_configured() || is_within_poll_window(schedule, weekday, now) {
+        return None;
+    }
+
+    let periods = parsed_schedule_periods(schedule);
+    if periods.is_empty() {
+        return None;
+    }
+
+    let now_mins = minutes_since_midnight(now);
+    for day_offset in 0..7u64 {
+        let day = add_days(weekday, day_offset as usize);
+        if schedule.is_rest_day(day) {
+            continue;
+        }
+
+        for (start, end) in &periods {
+            let start_mins = minutes_since_midnight(*start);
+            if day_offset == 0 && start_mins <= now_mins {
+                continue;
+            }
+
+            let wait_mins = day_offset * 24 * 60 + u64::from(start_mins) - u64::from(now_mins);
+            return Some(NextPollWindow {
+                label: format!("{}~{}", start.format("%H:%M"), end.format("%H:%M")),
+                wait: Duration::from_secs(wait_mins * 60),
+            });
+        }
+    }
+
+    None
+}
+
+fn parsed_schedule_periods(schedule: &PollingScheduleConfig) -> Vec<(NaiveTime, NaiveTime)> {
+    let mut periods = schedule
+        .periods
+        .iter()
+        .map(|period| parse_schedule_period(period).expect("validated schedule period"))
+        .collect::<Vec<_>>();
+    periods.sort_by_key(|(start, _)| *start);
+    periods
+}
+
+fn minutes_since_midnight(time: NaiveTime) -> u32 {
+    time.hour() * 60 + time.minute()
+}
+
+fn add_days(weekday: Weekday, days: usize) -> Weekday {
+    const WEEK: [Weekday; 7] = [
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ];
+
+    let idx = WEEK
+        .iter()
+        .position(|day| *day == weekday)
+        .expect("known weekday");
+    WEEK[(idx + days) % WEEK.len()]
 }
 
 // ─── 輔助函式 ─────────────────────────────────────────────────────────────────
@@ -578,6 +714,7 @@ pub fn current_unix_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScheduleWeekday;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── current_unix_secs ─────────────────────────────────────────────────────
@@ -641,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_trigger_timeout() {
         let interval = Duration::from_millis(50);
-        let result = wait_for_trigger(interval, None).await;
+        let result = wait_for_trigger(interval, None, &PollingScheduleConfig::default()).await;
         assert!(!result, "定時觸發應返回 false");
     }
 
@@ -657,7 +794,8 @@ mod tests {
             notify_clone.notify_one();
         });
 
-        let result = wait_for_trigger(interval, Some(&notify)).await;
+        let result =
+            wait_for_trigger(interval, Some(&notify), &PollingScheduleConfig::default()).await;
         assert!(result, "強制觸發應返回 true");
     }
 
@@ -675,7 +813,8 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let result = wait_for_trigger(interval, Some(&notify)).await;
+        let result =
+            wait_for_trigger(interval, Some(&notify), &PollingScheduleConfig::default()).await;
         let elapsed = start.elapsed();
 
         // 應該在 50ms 內返回（因為通知在 1ms 後觸發）
@@ -690,13 +829,64 @@ mod tests {
     async fn test_wait_for_trigger_no_force_respects_interval() {
         let interval = Duration::from_millis(100);
         let start = std::time::Instant::now();
-        let result = wait_for_trigger(interval, None).await;
+        let result = wait_for_trigger(interval, None, &PollingScheduleConfig::default()).await;
         let elapsed = start.elapsed();
 
         assert!(!result, "應為定時觸發");
         assert!(
             elapsed >= Duration::from_millis(90),
             "應等待至少 90ms，實際：{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_within_poll_window_true_during_period() {
+        let schedule = make_test_schedule();
+        assert!(is_within_poll_window(
+            &schedule,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_is_within_poll_window_false_on_rest_day() {
+        let schedule = make_test_schedule();
+        assert!(!is_within_poll_window(
+            &schedule,
+            Weekday::Sun,
+            NaiveTime::from_hms_opt(7, 30, 0).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_next_poll_window_between_periods_same_day() {
+        let schedule = make_test_schedule();
+        let next = next_poll_window(
+            &schedule,
+            Weekday::Mon,
+            NaiveTime::from_hms_opt(8, 5, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(next.label, "08:10~09:00");
+        assert_eq!(next.wait, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn test_next_poll_window_skips_sunday_rest_day() {
+        let schedule = make_test_schedule();
+        let next = next_poll_window(
+            &schedule,
+            Weekday::Sun,
+            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(next.label, "07:10~08:00");
+        assert_eq!(
+            next.wait,
+            Duration::from_secs((24 * 60 + 7 * 60 + 10 - 9 * 60) * 60)
         );
     }
 
@@ -865,5 +1055,12 @@ mod tests {
         let long = Duration::from_secs(60);
         assert!(short < long);
         assert!(long > short);
+    }
+
+    fn make_test_schedule() -> PollingScheduleConfig {
+        PollingScheduleConfig {
+            periods: vec!["07:10~08:00".to_string(), "08:10~09:00".to_string()],
+            rest_weekdays: vec![ScheduleWeekday::Sun],
+        }
     }
 }
