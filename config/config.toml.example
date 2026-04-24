@@ -47,6 +47,9 @@ channel_secret = "your_line_channel_secret"
 channel_access_token = "your_line_channel_access_token"
 webhook_port = 8080
 webhook_path = "/webhook"
+# 外部可連線的 webhook/scanner base URL，例如 ngrok 或反向代理網域。
+# 設定後 QR Code 通知會開啟本機 scanner，讓一次掃描可回傳給同一 rollcall 的多帳號。
+public_base_url = ""
 admin_user_id = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # ─── 時區設定 ────────────────────────────────────────────────────────────────

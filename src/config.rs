@@ -274,6 +274,9 @@ pub struct LineBotConfig {
     pub webhook_path: String,
 
     #[serde(default)]
+    pub public_base_url: String,
+
+    #[serde(default)]
     pub admin_user_id: String,
 }
 
@@ -285,6 +288,7 @@ impl Default for LineBotConfig {
             channel_access_token: String::new(),
             webhook_port: default_webhook_port(),
             webhook_path: default_webhook_path(),
+            public_base_url: String::new(),
             admin_user_id: String::new(),
         }
     }
@@ -524,6 +528,18 @@ impl AppConfig {
             }
         }
 
+        if !self.adapters.line_bot.public_base_url.trim().is_empty() {
+            let parsed =
+                url::Url::parse(self.adapters.line_bot.public_base_url.trim()).map_err(|_| {
+                    miette::miette!("adapters.line_bot.public_base_url 必須是有效的 http(s) URL")
+                })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(miette::miette!(
+                    "adapters.line_bot.public_base_url 必須是有效的 http(s) URL"
+                ));
+            }
+        }
+
         if self.monitor.retry_interval_secs == 0 {
             return Err(miette::miette!("monitor.retry_interval_secs 必須大於 0"));
         }
@@ -752,6 +768,7 @@ mod tests {
         assert!(lb.admin_user_id.is_empty());
         assert_eq!(lb.webhook_port, 8080);
         assert_eq!(lb.webhook_path, "/webhook");
+        assert!(lb.public_base_url.is_empty());
     }
 
     // ── Line Bot loading ──────────────────────────────────────────────────────
@@ -764,6 +781,7 @@ mod tests {
              enabled = true\n\
              channel_secret = \"mysecret\"\n\
              channel_access_token = \"mytoken\"\n\
+             public_base_url = \"https://example.ngrok-free.app\"\n\
              admin_user_id = \"U12345\"\n",
             minimal_toml()
         );
@@ -772,6 +790,10 @@ mod tests {
         assert!(cfg.adapters.line_bot.enabled);
         assert_eq!(cfg.adapters.line_bot.channel_secret, "mysecret");
         assert_eq!(cfg.adapters.line_bot.channel_access_token, "mytoken");
+        assert_eq!(
+            cfg.adapters.line_bot.public_base_url,
+            "https://example.ngrok-free.app"
+        );
         assert_eq!(cfg.adapters.line_bot.admin_user_id, "U12345");
         // port and path should keep their defaults
         assert_eq!(cfg.adapters.line_bot.webhook_port, 8080);
@@ -1133,6 +1155,18 @@ rest_weekdays = ["sun", "sun"]
         let f = write_toml(&toml);
         let cfg = AppConfig::load(f.path()).unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_public_base_url() {
+        let toml = format!(
+            "{}\n[adapters.line_bot]\nenabled = true\nchannel_secret = \"s\"\nchannel_access_token = \"t\"\nadmin_user_id = \"u\"\npublic_base_url = \"not a url\"\n",
+            minimal_toml()
+        );
+        let f = write_toml(&toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("public_base_url"), "got: {err}");
     }
 
     // ── Serialization ─────────────────────────────────────────────────────────

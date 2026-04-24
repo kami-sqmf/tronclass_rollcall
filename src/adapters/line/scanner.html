@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tronclass QR Scanner</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fb;
+      --text: #172033;
+      --muted: #667085;
+      --panel: #ffffff;
+      --border: #d7dce5;
+      --accent: #2563eb;
+      --ok: #15803d;
+      --error: #b91c1c;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10141f;
+        --text: #eef2ff;
+        --muted: #aab4c8;
+        --panel: #171d2b;
+        --border: #30394f;
+        --accent: #60a5fa;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      width: min(720px, 100%);
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .panel {
+      margin-top: 18px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    video, canvas {
+      display: block;
+      width: 100%;
+      max-height: 62vh;
+      border-radius: 8px;
+      background: #000;
+    }
+    canvas { display: none; }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    button {
+      min-height: 44px;
+      border: 0;
+      border-radius: 8px;
+      padding: 0 14px;
+      background: var(--accent);
+      color: white;
+      font-size: 15px;
+      font-weight: 650;
+    }
+    button.secondary {
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+    }
+    textarea {
+      width: 100%;
+      min-height: 96px;
+      margin-top: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font: inherit;
+      color: var(--text);
+      background: transparent;
+      resize: vertical;
+    }
+    #status {
+      margin-top: 12px;
+      font-weight: 650;
+    }
+    #status.ok { color: var(--ok); }
+    #status.error { color: var(--error); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Tronclass QR Scanner</h1>
+    <p>掃描課堂 QR Code 後會自動回傳給本機，並套用到同一個 rollcall 的所有等待帳號。</p>
+
+    <section class="panel">
+      <video id="preview" playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <div class="actions">
+        <button id="start" type="button">開啟相機</button>
+        <button id="stop" type="button" class="secondary">停止</button>
+      </div>
+      <div id="status">尚未掃描</div>
+    </section>
+
+    <section class="panel">
+      <p>如果相機無法開啟，可以貼上掃描到的 URL 或 p 參數。</p>
+      <textarea id="manual" placeholder="https://elearn2.fju.edu.tw/scanner-jumper?p=..."></textarea>
+      <div class="actions">
+        <button id="submitManual" type="button">送出</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const provider = params.get("provider") || "";
+    const rollcallId = Number(params.get("rollcall_id") || "0");
+    const token = params.get("token") || "";
+    const accountId = params.get("account_id") || "";
+    const statusEl = document.getElementById("status");
+    const video = document.getElementById("preview");
+    const canvas = document.getElementById("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    let stream = null;
+    let scanning = false;
+    let submitted = false;
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = kind || "";
+    }
+
+    async function submitQr(qrData) {
+      if (submitted) return;
+      submitted = true;
+      setStatus("正在回傳 QR Code...", "");
+      try {
+        const res = await fetch("/scanner/submit", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            provider,
+            rollcall_id: rollcallId,
+            account_id: accountId,
+            token,
+            qr_data: qrData
+          })
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(body.error || "回傳失敗");
+        }
+        setStatus(`已送出，${body.delivered_count || 0} 個帳號收到 QR Code。`, "ok");
+        stopCamera();
+      } catch (err) {
+        submitted = false;
+        setStatus(err.message || "回傳失敗", "error");
+      }
+    }
+
+    function tick() {
+      if (!scanning || video.readyState !== video.HAVE_ENOUGH_DATA) {
+        if (scanning) requestAnimationFrame(tick);
+        return;
+      }
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+      const code = window.jsQR && window.jsQR(imageData.data, imageData.width, imageData.height);
+      if (code && code.data) {
+        submitQr(code.data);
+        return;
+      }
+      requestAnimationFrame(tick);
+    }
+
+    async function startCamera() {
+      if (!provider || !rollcallId || !token || !accountId) {
+        setStatus("掃描連結缺少必要參數", "error");
+        return;
+      }
+      if (!window.jsQR) {
+        setStatus("QR 解碼器尚未載入，請稍後再試或改用手動貼上。", "error");
+        return;
+      }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+        scanning = true;
+        setStatus("正在掃描...", "");
+        requestAnimationFrame(tick);
+      } catch (err) {
+        setStatus("無法開啟相機，請確認瀏覽器權限或使用 HTTPS。", "error");
+      }
+    }
+
+    function stopCamera() {
+      scanning = false;
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+    }
+
+    document.getElementById("start").addEventListener("click", startCamera);
+    document.getElementById("stop").addEventListener("click", stopCamera);
+    document.getElementById("submitManual").addEventListener("click", () => {
+      const value = document.getElementById("manual").value.trim();
+      if (!value) {
+        setStatus("請先貼上 QR Code 內容", "error");
+        return;
+      }
+      submitQr(value);
+    });
+
+    startCamera();
+  </script>
+</body>
+</html>

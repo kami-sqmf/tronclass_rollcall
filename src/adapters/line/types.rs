@@ -523,6 +523,7 @@ pub struct ReplyMessageRequest {
 
 impl ReplyMessageRequest {
     /// 建立單則文字回覆
+    #[allow(dead_code)]
     pub fn text(reply_token: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             reply_token: reply_token.into(),
@@ -564,6 +565,7 @@ pub struct PushMessageRequest {
 
 impl PushMessageRequest {
     /// 建立單則文字推送
+    #[allow(dead_code)]
     pub fn text(to: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             to: to.into(),
@@ -791,166 +793,6 @@ impl std::fmt::Display for LineApiError {
     }
 }
 
-// ─── 指令解析 ─────────────────────────────────────────────────────────────────
-
-/// 從 Line Bot 訊息中解析出的指令
-#[derive(Debug, Clone, PartialEq)]
-pub enum BotCommand {
-    /// 狀態查詢：`/status` 或 `狀態`
-    Status,
-
-    /// 強制簽到：`/force` 或 `強制簽到`
-    ForceAttend,
-
-    /// 停止監控：`/stop` 或 `停止`
-    Stop,
-
-    /// 重新啟動監控：`/start` 或 `啟動`
-    Start,
-
-    /// 重新登錄：`/reauth` 或 `重新登錄`
-    ReAuth,
-
-    /// 傳入 QR code URL 或資料
-    QrCode(String),
-
-    /// 說明：`/help` 或 `幫助`
-    Help,
-
-    /// 未知指令或純文字
-    Unknown(String),
-}
-
-impl BotCommand {
-    /// 從訊息文字解析指令
-    pub fn parse(text: &str) -> Self {
-        let text = text.trim();
-
-        // 先嘗試識別 QR code
-        if Self::looks_like_qr_code(text) {
-            return BotCommand::QrCode(text.to_string());
-        }
-
-        // 指令對應表（不區分大小寫）
-        match text.to_lowercase().as_str() {
-            "/status" | "status" | "狀態" | "查詢" => BotCommand::Status,
-            "/force" | "force" | "強制簽到" | "手動簽到" => BotCommand::ForceAttend,
-            "/stop" | "stop" | "停止" | "暫停" => BotCommand::Stop,
-            "/start" | "start" | "啟動" | "開始" => BotCommand::Start,
-            "/reauth" | "reauth" | "重新登錄" | "重新認證" => BotCommand::ReAuth,
-            "/help" | "help" | "幫助" | "說明" | "?" | "？" => BotCommand::Help,
-            _ => BotCommand::Unknown(text.to_string()),
-        }
-    }
-
-    /// 判斷文字是否看起來像 QR code 資料
-    fn looks_like_qr_code(text: &str) -> bool {
-        // 完整 URL
-        if text.contains("elearn2.fju.edu.tw")
-            || text.contains("/scanner-jumper?p=")
-            || text.contains("/j?p=")
-        {
-            return true;
-        }
-
-        // p 參數格式（含 ~ 和 !）
-        if text.contains('~') && text.contains('!') {
-            let looks_like_segments = text.split('!').take(2).all(|s| s.contains('~'));
-            if looks_like_segments {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// 取得指令的說明文字
-    pub fn help_text() -> &'static str {
-        "📚 可用指令：\n\
-         \n\
-         /status - 查看目前監控狀態\n\
-         /start  - 啟動簽到監控\n\
-         /stop   - 暫停簽到監控\n\
-         /force  - 立即觸發一次簽到檢查\n\
-         /reauth - 重新登錄（Session 過期時使用）\n\
-         /help   - 顯示此說明\n\
-         \n\
-         💡 當有 QR Code 簽到時，\n\
-         直接貼上掃描到的 URL 或 p 參數即可"
-    }
-}
-
-impl std::fmt::Display for BotCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BotCommand::Status => write!(f, "Status"),
-            BotCommand::ForceAttend => write!(f, "ForceAttend"),
-            BotCommand::Stop => write!(f, "Stop"),
-            BotCommand::Start => write!(f, "Start"),
-            BotCommand::ReAuth => write!(f, "ReAuth"),
-            BotCommand::QrCode(data) => write!(f, "QrCode({}...)", &data[..data.len().min(20)]),
-            BotCommand::Help => write!(f, "Help"),
-            BotCommand::Unknown(text) => write!(f, "Unknown({text})"),
-        }
-    }
-}
-
-// ─── 監控狀態 ─────────────────────────────────────────────────────────────────
-
-/// Bot 監控狀態（用於 /status 指令回覆）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorStatus {
-    /// 是否正在運行
-    pub is_running: bool,
-
-    /// 登錄的使用者名稱
-    pub user_name: String,
-
-    /// 最後一次輪詢時間（Unix 秒時間戳）
-    pub last_poll_timestamp: Option<i64>,
-
-    /// 最後一次成功簽到的課程名稱
-    pub last_success_course: Option<String>,
-
-    /// 已連續失敗次數
-    pub consecutive_failures: u32,
-
-    /// 系統啟動時間（Unix 秒時間戳）
-    pub started_at: i64,
-}
-
-impl MonitorStatus {
-    /// 格式化為 Line 訊息文字
-    pub fn to_line_message(&self) -> String {
-        let status_emoji = if self.is_running { "✅" } else { "⏸️" };
-        let status_text = if self.is_running {
-            "運行中"
-        } else {
-            "已暫停"
-        };
-
-        let last_poll = self
-            .last_poll_timestamp
-            .map(|ts| {
-                // 簡單格式化（實際使用可以改用 chrono）
-                format!("{ts} (Unix)")
-            })
-            .unwrap_or_else(|| "尚未輪詢".to_string());
-
-        let last_success = self.last_success_course.as_deref().unwrap_or("無");
-
-        format!(
-            "📊 系統狀態\n\
-             狀態：{status_emoji} {status_text}\n\
-             帳號：{}\n\
-             最後輪詢：{last_poll}\n\
-             最後成功：{last_success}\n\
-             連續失敗：{} 次",
-            self.user_name, self.consecutive_failures,
-        )
-    }
-}
-
 // ─── 測試 ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1159,103 +1001,6 @@ mod tests {
         assert_eq!(json["messages"][0]["text"], "Reply!");
     }
 
-    // ── BotCommand 解析 ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_command_status() {
-        assert_eq!(BotCommand::parse("/status"), BotCommand::Status);
-        assert_eq!(BotCommand::parse("status"), BotCommand::Status);
-        assert_eq!(BotCommand::parse("狀態"), BotCommand::Status);
-        assert_eq!(BotCommand::parse("查詢"), BotCommand::Status);
-    }
-
-    #[test]
-    fn test_parse_command_help() {
-        assert_eq!(BotCommand::parse("/help"), BotCommand::Help);
-        assert_eq!(BotCommand::parse("help"), BotCommand::Help);
-        assert_eq!(BotCommand::parse("幫助"), BotCommand::Help);
-        assert_eq!(BotCommand::parse("?"), BotCommand::Help);
-        assert_eq!(BotCommand::parse("？"), BotCommand::Help);
-    }
-
-    #[test]
-    fn test_parse_command_stop_start() {
-        assert_eq!(BotCommand::parse("/stop"), BotCommand::Stop);
-        assert_eq!(BotCommand::parse("停止"), BotCommand::Stop);
-        assert_eq!(BotCommand::parse("/start"), BotCommand::Start);
-        assert_eq!(BotCommand::parse("啟動"), BotCommand::Start);
-    }
-
-    #[test]
-    fn test_parse_command_force() {
-        assert_eq!(BotCommand::parse("/force"), BotCommand::ForceAttend);
-        assert_eq!(BotCommand::parse("強制簽到"), BotCommand::ForceAttend);
-    }
-
-    #[test]
-    fn test_parse_command_reauth() {
-        assert_eq!(BotCommand::parse("/reauth"), BotCommand::ReAuth);
-        assert_eq!(BotCommand::parse("重新登錄"), BotCommand::ReAuth);
-    }
-
-    #[test]
-    fn test_parse_command_qr_code_url() {
-        let url = "https://elearn2.fju.edu.tw/scanner-jumper?p=0~100!3~data";
-        let cmd = BotCommand::parse(url);
-        assert!(matches!(cmd, BotCommand::QrCode(_)));
-        if let BotCommand::QrCode(data) = cmd {
-            assert_eq!(data, url);
-        }
-    }
-
-    #[test]
-    fn test_parse_command_qr_code_p_param() {
-        let p = "0~12345!3~mydata!4~67890";
-        let cmd = BotCommand::parse(p);
-        assert!(matches!(cmd, BotCommand::QrCode(_)));
-    }
-
-    #[test]
-    fn test_parse_command_unknown() {
-        let cmd = BotCommand::parse("隨便說話");
-        assert!(matches!(cmd, BotCommand::Unknown(_)));
-        if let BotCommand::Unknown(text) = cmd {
-            assert_eq!(text, "隨便說話");
-        }
-    }
-
-    #[test]
-    fn test_parse_command_trimmed() {
-        // 前後空白應被忽略
-        assert_eq!(BotCommand::parse("  /status  "), BotCommand::Status);
-        assert_eq!(BotCommand::parse("\t狀態\n"), BotCommand::Status);
-    }
-
-    #[test]
-    fn test_parse_command_case_insensitive() {
-        assert_eq!(BotCommand::parse("STATUS"), BotCommand::Status);
-        assert_eq!(BotCommand::parse("Status"), BotCommand::Status);
-        assert_eq!(BotCommand::parse("STOP"), BotCommand::Stop);
-    }
-
-    #[test]
-    fn test_command_display() {
-        assert_eq!(BotCommand::Status.to_string(), "Status");
-        assert_eq!(BotCommand::Help.to_string(), "Help");
-        let qr = BotCommand::QrCode("0~100!3~abcdef".to_string());
-        let s = qr.to_string();
-        assert!(s.starts_with("QrCode("));
-    }
-
-    #[test]
-    fn test_help_text_not_empty() {
-        let help = BotCommand::help_text();
-        assert!(!help.is_empty());
-        assert!(help.contains("/status"));
-        assert!(help.contains("/stop"));
-        assert!(help.contains("/start"));
-    }
-
     // ── LineApiError display ──────────────────────────────────────────────────
 
     #[test]
@@ -1281,43 +1026,6 @@ mod tests {
         };
         let s = err.to_string();
         assert!(s.contains("Unauthorized"));
-    }
-
-    // ── MonitorStatus ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_monitor_status_to_line_message_running() {
-        let status = MonitorStatus {
-            is_running: true,
-            user_name: "張三".to_string(),
-            last_poll_timestamp: Some(1_700_000_000),
-            last_success_course: Some("計算機網路".to_string()),
-            consecutive_failures: 0,
-            started_at: 1_699_900_000,
-        };
-        let msg = status.to_line_message();
-        assert!(msg.contains("✅"));
-        assert!(msg.contains("運行中"));
-        assert!(msg.contains("張三"));
-        assert!(msg.contains("計算機網路"));
-    }
-
-    #[test]
-    fn test_monitor_status_to_line_message_paused() {
-        let status = MonitorStatus {
-            is_running: false,
-            user_name: "李四".to_string(),
-            last_poll_timestamp: None,
-            last_success_course: None,
-            consecutive_failures: 3,
-            started_at: 1_699_900_000,
-        };
-        let msg = status.to_line_message();
-        assert!(msg.contains("⏸️"));
-        assert!(msg.contains("已暫停"));
-        assert!(msg.contains("尚未輪詢"));
-        assert!(msg.contains("無"));
-        assert!(msg.contains('3'));
     }
 
     // ── PostbackEvent ─────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 //! - 定期輪詢 `/api/radar/rollcalls`
 //! - 偵測到新的待簽到項目時，分派到對應的簽到模組
 //! - Session 過期時自動重新認證
-//! - 透過 `WebhookState` 接收 Line Bot 的控制指令（/stop、/start、/force）
+//! - 透過 request state 接收 adapter 的控制指令（/stop、/start、/force）
 //! - 更新 `MonitorStatus` 供 `/status` 指令查詢
 //!
 //! # 執行流程
@@ -36,14 +36,17 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::account::AccountConfig;
-use crate::adapters::line::types::MonitorStatus;
-use crate::adapters::line::{LineBotClient, WebhookAccountState};
+use crate::adapters::events::{
+    AdapterMessenger, MonitorStatus, OutboundMessage, SystemStartedEvent,
+};
+use crate::adapters::requests::{
+    create_qrcode_channel, QrCodeReceiver, QrCodeSender, RequestAccountState,
+};
+use crate::adapters::scanner::QrScannerRegistry;
 use crate::api::{is_auth_error, ApiClient};
 use crate::auth::AuthClient;
 use crate::config::{parse_schedule_period, AppConfig, PollingScheduleConfig};
-use crate::rollcalls::{
-    create_qrcode_channel, process_rollcall_batch, BatchSummary, QrCodeReceiver, QrCodeSender,
-};
+use crate::rollcalls::{process_rollcall_batch, BatchSummary};
 
 // ─── 監控器設定 ───────────────────────────────────────────────────────────────
 
@@ -61,17 +64,20 @@ pub struct MonitorContext {
     /// Tronclass API 客戶端
     pub api_client: Arc<ApiClient>,
 
-    /// Line Bot 客戶端（可選）
-    pub line_bot: Option<Arc<LineBotClient>>,
+    /// Adapter messenger（可選）
+    pub messenger: Option<Arc<dyn AdapterMessenger>>,
 
-    /// 此帳號在 Webhook 中可操作的共享狀態
-    pub webhook_account: Option<WebhookAccountState>,
+    /// 此帳號可被 adapter 使用者請求操作的共享狀態
+    pub request_account: Option<RequestAccountState>,
 
     /// QR code 輸入通道接收端
     pub qr_rx: QrCodeReceiver,
 
     /// QR code 輸入通道傳送端（可複製給 Webhook handler）
     pub qr_tx: QrCodeSender,
+
+    /// 共享 QR scanner registry（可選）
+    pub scanner_registry: Option<Arc<QrScannerRegistry>>,
 
     /// 共享的監控狀態
     pub status: Arc<Mutex<MonitorStatus>>,
@@ -89,8 +95,9 @@ impl MonitorContext {
     pub async fn new(
         global_config: Arc<AppConfig>,
         account: Arc<AccountConfig>,
-        line_bot: Option<Arc<LineBotClient>>,
-        interactive_line: bool,
+        messenger: Option<Arc<dyn AdapterMessenger>>,
+        interactive_adapter: bool,
+        scanner_registry: Option<Arc<QrScannerRegistry>>,
     ) -> Result<Self> {
         // ── 登錄 ──────────────────────────────────────────────────────────────
         info!(account = %account.id, "正在登錄 Tronclass...");
@@ -123,9 +130,9 @@ impl MonitorContext {
             started_at,
         }));
 
-        // ── Webhook 帳號狀態 ──────────────────────────────────────────────────
-        let webhook_account = if interactive_line && line_bot.is_some() {
-            Some(WebhookAccountState::new(
+        // ── Adapter request 帳號狀態 ──────────────────────────────────────────
+        let request_account = if interactive_adapter && messenger.is_some() {
+            Some(RequestAccountState::new(
                 account.id.clone(),
                 account.line_user_id.clone(),
                 qr_tx.clone(),
@@ -140,10 +147,11 @@ impl MonitorContext {
             account,
             auth_client,
             api_client,
-            line_bot,
-            webhook_account,
+            messenger,
+            request_account,
             qr_rx,
             qr_tx,
+            scanner_registry,
             status,
         })
     }
@@ -178,17 +186,17 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
         tokio::time::sleep(startup_delay).await;
     }
 
-    // 取得控制訊號的參考（從 webhook_account）
+    // 取得控制訊號的參考（從 request_account）
     let force_poll_notify = ctx
-        .webhook_account
+        .request_account
         .as_ref()
         .map(|s| Arc::clone(&s.force_poll_tx));
     let reauth_notify = ctx
-        .webhook_account
+        .request_account
         .as_ref()
         .map(|s| Arc::clone(&s.reauth_tx));
     let is_running_lock = ctx
-        .webhook_account
+        .request_account
         .as_ref()
         .map(|s| Arc::clone(&s.is_running));
     let schedule = ctx.account.provider_config.schedule.clone();
@@ -196,21 +204,19 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
     info!(account = %account_label, "🚀 開始主監控循環");
 
     // 傳送啟動通知給該帳號綁定使用者（若未綁定則退回管理員）
-    if let Some(bot) = &ctx.line_bot {
+    if let Some(bot) = &ctx.messenger {
         let user_name = {
             let s = ctx.status.lock().await;
             s.user_name.clone()
         };
-        let startup_msg = format!(
-            "🚀 Tronclass Rollcall 已啟動\n\
-             帳號：{} / {user_name}\n\
-             輪詢間隔：{} 秒\n\
-             Line Bot：已啟用\n\n\
-             輸入 /help 查看可用指令",
-            account_label, ctx.account.provider_config.api.poll_interval_secs,
-        );
+        let startup_msg = OutboundMessage::SystemStarted(SystemStartedEvent {
+            account: account_label.clone(),
+            user_name,
+            poll_interval_secs: ctx.account.provider_config.api.poll_interval_secs,
+            adapter_name: bot.adapter_name().to_string(),
+        });
         if let Err(e) = bot
-            .push_message_to_user_or_admin(&ctx.account.line_user_id, &startup_msg)
+            .push_to_user_or_admin(&ctx.account.line_user_id, &startup_msg)
             .await
         {
             warn!(error = %e, "發送啟動通知失敗");
@@ -257,21 +263,27 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                 info!("收到重新認證請求");
                 if let Err(e) = do_reauth(&mut ctx).await {
                     error!(error = %e, "重新認證失敗");
-                    if let Some(bot) = &ctx.line_bot {
+                    if let Some(bot) = &ctx.messenger {
                         let _ = bot
-                            .push_message_to_user_or_admin(
+                            .push_to_user_or_admin(
                                 &ctx.account.line_user_id,
-                                &format!("❌ [{}] 重新認證失敗：{e}", account_label),
+                                &OutboundMessage::Text(format!(
+                                    "❌ [{}] 重新認證失敗：{e}",
+                                    account_label
+                                )),
                             )
                             .await;
                     }
                 } else {
                     consecutive_failures = 0;
-                    if let Some(bot) = &ctx.line_bot {
+                    if let Some(bot) = &ctx.messenger {
                         let _ = bot
-                            .push_message_to_user_or_admin(
+                            .push_to_user_or_admin(
                                 &ctx.account.line_user_id,
-                                &format!("✅ [{}] 重新認證成功！", account_label),
+                                &OutboundMessage::Text(format!(
+                                    "✅ [{}] 重新認證成功！",
+                                    account_label
+                                )),
                             )
                             .await;
                     }
@@ -337,14 +349,14 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                         warn!("偵測到認證錯誤，嘗試重新認證");
                     }
 
-                    if let Some(bot) = &ctx.line_bot {
+                    if let Some(bot) = &ctx.messenger {
                         let _ = bot
-                            .push_message_to_user_or_admin(
+                            .push_to_user_or_admin(
                                 &ctx.account.line_user_id,
-                                &format!(
+                                &OutboundMessage::Text(format!(
                                     "⚠️ [{}] 簽到監控遇到錯誤，嘗試重新認證...\n錯誤：{e}",
                                     account_label
-                                ),
+                                )),
                             )
                             .await;
                     }
@@ -357,27 +369,30 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                                 let mut s = ctx.status.lock().await;
                                 s.consecutive_failures = 0;
                             }
-                            if let Some(bot) = &ctx.line_bot {
+                            if let Some(bot) = &ctx.messenger {
                                 let _ = bot
-                                    .push_message_to_user_or_admin(
+                                    .push_to_user_or_admin(
                                         &ctx.account.line_user_id,
-                                        &format!("✅ [{}] 自動重新認證成功！", account_label),
+                                        &OutboundMessage::Text(format!(
+                                            "✅ [{}] 自動重新認證成功！",
+                                            account_label
+                                        )),
                                     )
                                     .await;
                             }
                         }
                         Err(reauth_err) => {
                             error!(error = %reauth_err, "重新認證失敗！");
-                            if let Some(bot) = &ctx.line_bot {
+                            if let Some(bot) = &ctx.messenger {
                                 let _ = bot
-                                    .push_message_to_user_or_admin(
+                                    .push_to_user_or_admin(
                                         &ctx.account.line_user_id,
-                                        &format!(
+                                        &OutboundMessage::Text(format!(
                                             "❌ [{}] 自動重新認證失敗：{reauth_err}\n\n\
                                          請手動更新 accounts.toml 中對應帳號的 manual_cookie，\n\
                                          或輸入 /reauth 再次嘗試。",
                                             account_label
-                                        ),
+                                        )),
                                     )
                                     .await;
                             }
@@ -457,15 +472,17 @@ async fn do_poll_and_attend(ctx: &mut MonitorContext) -> Result<BatchSummary> {
     }
 
     // ── 執行批次簽到 ──────────────────────────────────────────────────────────
-    let line_bot_ref = ctx.line_bot.as_ref().map(|b| b.as_ref());
+    let messenger_ref = ctx.messenger.as_ref().map(|b| b.as_ref());
 
     let outcomes = process_rollcall_batch(
         Arc::clone(&ctx.api_client),
         rollcalls,
         &ctx.account,
         ctx.account.display_name(),
-        line_bot_ref,
-        ctx.webhook_account.as_ref().map(|_| Arc::clone(&ctx.qr_rx)),
+        messenger_ref,
+        ctx.request_account.as_ref().map(|_| Arc::clone(&ctx.qr_rx)),
+        ctx.request_account.as_ref().map(|_| ctx.qr_tx.clone()),
+        ctx.scanner_registry.as_ref().map(Arc::clone),
     )
     .await;
 
@@ -893,7 +910,7 @@ mod tests {
     // ── MonitorStatus 相關 ────────────────────────────────────────────────────
 
     #[test]
-    fn test_monitor_status_default_display() {
+    fn test_monitor_status_payload_fields() {
         let status = MonitorStatus {
             is_running: true,
             user_name: "test_user".to_string(),
@@ -903,12 +920,10 @@ mod tests {
             started_at: 1_699_900_000,
         };
 
-        let msg = status.to_line_message();
-
-        // 驗證包含關鍵資訊
-        assert!(msg.contains("test_user"), "應包含使用者名稱");
-        assert!(msg.contains("計算機概論"), "應包含最後成功課程");
-        assert!(msg.contains('2'), "應包含失敗次數");
+        assert!(status.is_running);
+        assert_eq!(status.user_name, "test_user");
+        assert_eq!(status.last_success_course.as_deref(), Some("計算機概論"));
+        assert_eq!(status.consecutive_failures, 2);
     }
 
     #[test]
@@ -922,9 +937,8 @@ mod tests {
             started_at: 0,
         };
 
-        let msg = status.to_line_message();
-        assert!(msg.contains("尚未輪詢"));
-        assert!(msg.contains("無"));
+        assert_eq!(status.last_poll_timestamp, None);
+        assert_eq!(status.last_success_course, None);
     }
 
     // ── BatchSummary 整合 ─────────────────────────────────────────────────────
@@ -1012,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_integration() {
-        use crate::rollcalls::create_qrcode_channel;
+        use crate::adapters::requests::create_qrcode_channel;
 
         let (tx, rx) = create_qrcode_channel(2);
 
@@ -1027,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_qrcode_channel_overflow() {
-        use crate::rollcalls::create_qrcode_channel;
+        use crate::adapters::requests::create_qrcode_channel;
 
         let (tx, _rx) = create_qrcode_channel(1); // 容量只有 1
 

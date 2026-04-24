@@ -643,7 +643,7 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(config);
     let line_bot = if config.adapters.line_bot.enabled {
-        match adapters::line::LineBotClient::new(&config.adapters.line_bot) {
+        match adapters::line::client::LineBotClient::new(&config.adapters.line_bot) {
             Ok(bot) => Some(Arc::new(bot)),
             Err(e) => {
                 warn!(error = %e, "Line Bot 初始化失敗，將在無 Line Bot 模式下運行");
@@ -656,7 +656,23 @@ async fn main() -> Result<()> {
 
     // ── 4. 建立監控器上下文 ────────────────────────────────────────────────────
     info!(account_count = accounts.len(), "初始化監控器...");
-    let interactive_line = line_bot.is_some();
+    let adapter_messenger: Option<Arc<dyn adapters::events::AdapterMessenger>> = line_bot
+        .as_ref()
+        .map(|bot| Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>);
+    let interactive_line = adapter_messenger.is_some();
+    let scanner_registry = if interactive_line {
+        let public_base_url = config.adapters.line_bot.public_base_url.trim();
+        if public_base_url.is_empty() {
+            warn!("adapters.line_bot.public_base_url 未設定，QR Code 將沿用 legacy scanner URL");
+            None
+        } else {
+            Some(Arc::new(adapters::scanner::QrScannerRegistry::new(
+                public_base_url.to_string(),
+            )))
+        }
+    } else {
+        None
+    };
 
     let mut contexts = Vec::with_capacity(accounts.len());
     for account in accounts {
@@ -664,8 +680,9 @@ async fn main() -> Result<()> {
         let ctx = match monitor::MonitorContext::new(
             Arc::clone(&config),
             Arc::clone(&account),
-            line_bot.as_ref().map(Arc::clone),
+            adapter_messenger.as_ref().map(Arc::clone),
             interactive_line,
+            scanner_registry.as_ref().map(Arc::clone),
         )
         .await
         {
@@ -684,18 +701,32 @@ async fn main() -> Result<()> {
         if let Some(bot) = line_bot.as_ref() {
             let webhook_accounts = contexts
                 .iter()
-                .filter_map(|ctx| ctx.webhook_account.clone())
+                .filter_map(|ctx| ctx.request_account.clone())
                 .collect::<Vec<_>>();
-            let webhook_state =
-                adapters::line::WebhookState::new(Arc::clone(bot), webhook_accounts);
+            let request_state = adapters::requests::RequestState::new(
+                adapter_messenger
+                    .as_ref()
+                    .map(Arc::clone)
+                    .expect("interactive adapter has messenger"),
+                webhook_accounts,
+            );
+            let webhook_state = adapters::line::webhook::LineWebhookState::new(
+                Arc::clone(bot),
+                request_state,
+                scanner_registry.as_ref().map(Arc::clone),
+            );
             let port = config.adapters.line_bot.webhook_port;
             let webhook_path = config.adapters.line_bot.webhook_path.clone();
 
             info!(port = port, path = %webhook_path, "啟動 Line Bot Webhook 伺服器...");
 
             let handle = tokio::spawn(async move {
-                if let Err(e) =
-                    adapters::line::start_webhook_server(webhook_state, port, &webhook_path).await
+                if let Err(e) = adapters::line::webhook::start_webhook_server(
+                    webhook_state,
+                    port,
+                    &webhook_path,
+                )
+                .await
                 {
                     error!(error = %e, "Webhook 伺服器異常退出");
                 }
