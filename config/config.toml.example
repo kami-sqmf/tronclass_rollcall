@@ -49,6 +49,11 @@ webhook_port = 8080
 webhook_path = "/webhook"
 admin_user_id = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
+# ─── 時區設定 ────────────────────────────────────────────────────────────────
+
+[time]
+timezone = "Asia/Taipei"
+
 # ─── 日誌設定 ────────────────────────────────────────────────────────────────
 
 [logging]

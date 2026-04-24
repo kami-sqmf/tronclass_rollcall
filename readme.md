@@ -114,8 +114,18 @@ min_concurrency = 10
 - 如果之後需要多段時間，也可以寫成 `periods = ["07:10~12:00", "13:40~17:30"]`。
 - `rest_weekdays`：休息日，例如 `["sun"]` 代表星期日不輪詢。
 
+時區設定：
+
+```toml
+[time]
+timezone = "Asia/Taipei"
+```
+
+- `time.timezone` 可設為 `local`、`UTC`，或像 `Asia/Taipei` 這種 IANA 時區名稱。
+- 課堂時段判斷與 log timestamp 會共用這個時區設定。
+
 > [!NOTE]
-> 時段判斷使用程式執行機器的本地時間。`kind = "fju"` 且未自行覆蓋 `schedule` 時，會自動套用 `periods = ["07:10~17:30"]` 與 `rest_weekdays = ["sun"]`。
+> `kind = "fju"` 且未自行覆蓋 `schedule` 時，會自動套用 `periods = ["07:10~17:30"]` 與 `rest_weekdays = ["sun"]`。
 
 > [!NOTE]
 > `400` / `422` 代表數字錯誤，是正常嘗試流程，不會計入異常失敗。`429`、`408`、`5xx`、timeout、connect error 與非預期狀態會計入暫時性失敗。

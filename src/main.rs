@@ -26,7 +26,11 @@ use std::sync::Arc;
 
 use miette::Result;
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{
+    fmt::{self, format::Writer, time::FormatTime},
+    prelude::*,
+    EnvFilter,
+};
 
 // ─── 帳號管理子命令 ───────────────────────────────────────────────────────────
 
@@ -459,6 +463,7 @@ fn init_tracing(log_level: &str) {
     tracing_subscriber::registry()
         .with(
             fmt::layer()
+                .with_timer(LocalTimestamp)
                 .with_target(true)
                 .with_thread_ids(false)
                 .with_file(false)
@@ -467,6 +472,36 @@ fn init_tracing(log_level: &str) {
         )
         .with(filter)
         .init();
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalTimestamp;
+
+impl FormatTime for LocalTimestamp {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"))
+    }
+}
+
+fn apply_runtime_timezone(timezone: &str) -> Result<()> {
+    let timezone = timezone.trim();
+    if timezone.is_empty() {
+        return Err(miette::miette!("time.timezone 不可為空"));
+    }
+
+    let use_system_timezone = timezone.eq_ignore_ascii_case("local");
+    if use_system_timezone {
+        std::env::remove_var("TZ");
+    } else {
+        std::env::set_var("TZ", timezone);
+    }
+
+    #[cfg(unix)]
+    unsafe {
+        tzset();
+    }
+
+    Ok(())
 }
 
 fn supports_ansi() -> bool {
@@ -487,6 +522,11 @@ fn libc_isatty(fd: i32) -> bool {
         fn isatty(fd: i32) -> i32;
     }
     unsafe { isatty(fd) != 0 }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn tzset();
 }
 
 // ─── 主函式 ───────────────────────────────────────────────────────────────────
@@ -587,6 +627,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    apply_runtime_timezone(&config.time.timezone)?;
+
     // config 載入後才初始化 tracing，確保使用設定檔中的等級
     init_tracing(&config.logging.level);
 
@@ -594,6 +636,7 @@ async fn main() -> Result<()> {
         version = VERSION,
         config = %args.config_path.display(),
         accounts_db = %args.accounts_path.display(),
+        timezone = %config.time.timezone,
         log_level = %config.logging.level,
         "設定載入完成"
     );

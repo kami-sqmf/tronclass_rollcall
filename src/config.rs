@@ -37,6 +37,9 @@ pub struct AppConfig {
     /// Adapters 設定
     #[serde(default)]
     pub adapters: AdapterConfig,
+    /// 時區設定
+    #[serde(default)]
+    pub time: TimeConfig,
     /// 日誌設定
     pub logging: LoggingConfig,
     /// 監控設定
@@ -287,6 +290,23 @@ impl Default for LineBotConfig {
     }
 }
 
+// ======== Time ========
+/// 時區設定
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimeConfig {
+    /// 執行時區；可設為 `local`、`UTC` 或 IANA 時區名稱（例如 `Asia/Taipei`）
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+}
+
+impl Default for TimeConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_timezone(),
+        }
+    }
+}
+
 // ======== Logging ========
 /// 日誌設定
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -366,6 +386,9 @@ fn default_webhook_path() -> String {
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_timezone() -> String {
+    "local".to_string()
 }
 fn default_log_file_path() -> String {
     "tronclass_rollcall.log".to_string()
@@ -508,6 +531,9 @@ impl AppConfig {
             return Err(miette::miette!(
                 "monitor.max_failures_before_reauth 必須大於 0"
             ));
+        }
+        if self.time.timezone.trim().is_empty() {
+            return Err(miette::miette!("time.timezone 不可為空"));
         }
 
         Ok(())
@@ -673,6 +699,13 @@ mod tests {
     }
 
     #[test]
+    fn test_time_defaults_when_section_missing() {
+        let f = write_toml(minimal_toml());
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.time.timezone, "local");
+    }
+
+    #[test]
     fn test_monitor_defaults_when_section_empty() {
         let f = write_toml(minimal_toml());
         let cfg = AppConfig::load(f.path()).unwrap();
@@ -759,6 +792,19 @@ mod tests {
         let cfg = AppConfig::load(f.path()).unwrap();
         assert_eq!(cfg.adapters.line_bot.webhook_port, 9090);
         assert_eq!(cfg.adapters.line_bot.webhook_path, "/line");
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_timezone() {
+        let toml = format!(
+            "{}\n\
+             [time]\n\
+             timezone = \"\"\n",
+            minimal_toml()
+        );
+        let f = write_toml(&toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     // ── Provider loading ──────────────────────────────────────────────────────

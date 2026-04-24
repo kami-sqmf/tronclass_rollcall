@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently uses pre-1.0 versioning.
+The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+## [0.1.1] - 2026-04-24
+
+### Fixed
+
+- Added configurable runtime timezone support through `[time].timezone` so scheduled polling follows the intended local timezone instead of the host default.
+- Fixed tracing log timestamps to use the configured local timezone and include the UTC offset, keeping log time consistent with monitor scheduling.
+- Updated the sample configuration and documentation to show `timezone = "Asia/Taipei"` for local deployments.
 
 ## [0.1.1] - 2026-04-24
 
