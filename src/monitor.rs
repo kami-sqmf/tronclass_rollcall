@@ -18,7 +18,7 @@
 //!  └── run_monitor_loop()          ← 進入主監控循環（阻塞）
 //!       ├── sleep(startup_delay)
 //!       └── loop {
-//!             wait_for_trigger()   ← 等待定時或強制觸發
+//!             wait_for_trigger()   ← 等待定時、強制觸發或重新認證
 //!             if !is_running { continue }
 //!             get_rollcalls()
 //!             process_rollcall_batch()
@@ -37,7 +37,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::account::AccountConfig;
 use crate::adapters::events::{
-    AdapterMessenger, MonitorStatus, OutboundMessage, SystemStartedEvent,
+    AdapterAccountTarget, AdapterMessenger, MonitorStatus, OutboundMessage, SystemStartedEvent,
 };
 use crate::adapters::requests::{
     create_qrcode_channel, QrCodeReceiver, QrCodeSender, RequestAccountState,
@@ -69,6 +69,9 @@ pub struct MonitorContext {
 
     /// 此帳號可被 adapter 使用者請求操作的共享狀態
     pub request_account: Option<RequestAccountState>,
+
+    /// 此帳號在各 adapter 的綁定目標（可由 Discord 控制台即時更新）
+    pub adapter_target: Arc<Mutex<AdapterAccountTarget>>,
 
     /// QR code 輸入通道接收端
     pub qr_rx: QrCodeReceiver,
@@ -130,11 +133,18 @@ impl MonitorContext {
             started_at,
         }));
 
+        let adapter_target = Arc::new(Mutex::new(AdapterAccountTarget::new(
+            account.id.clone(),
+            account.line_user_id.clone(),
+            account.discord_user_id.clone(),
+        )));
+
         // ── Adapter request 帳號狀態 ──────────────────────────────────────────
         let request_account = if interactive_adapter && messenger.is_some() {
-            Some(RequestAccountState::new(
+            Some(RequestAccountState::new_with_target(
                 account.id.clone(),
-                account.line_user_id.clone(),
+                account.username.clone(),
+                Arc::clone(&adapter_target),
                 qr_tx.clone(),
                 Arc::clone(&status),
             ))
@@ -149,6 +159,7 @@ impl MonitorContext {
             api_client,
             messenger,
             request_account,
+            adapter_target,
             qr_rx,
             qr_tx,
             scanner_registry,
@@ -215,10 +226,8 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
             poll_interval_secs: ctx.account.provider_config.api.poll_interval_secs,
             adapter_name: bot.adapter_name().to_string(),
         });
-        if let Err(e) = bot
-            .push_to_user_or_admin(&ctx.account.line_user_id, &startup_msg)
-            .await
-        {
+        let target = ctx.adapter_target.lock().await.clone();
+        if let Err(e) = bot.push_to_account_or_admin(&target, &startup_msg).await {
             warn!(error = %e, "發送啟動通知失敗");
         }
     }
@@ -228,17 +237,54 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
     let retry_interval = Duration::from_secs(config.monitor.retry_interval_secs);
 
     loop {
-        // ── 等待觸發（定時 or 強制） ──────────────────────────────────────────
-        let triggered_by_force =
-            wait_for_trigger(poll_interval, force_poll_notify.as_deref(), &schedule).await;
+        // ── 等待觸發（定時、強制 or 重新認證）──────────────────────────────────
+        let trigger = wait_for_trigger(
+            poll_interval,
+            force_poll_notify.as_deref(),
+            reauth_notify.as_deref(),
+            &schedule,
+        )
+        .await;
 
-        if triggered_by_force {
-            debug!("由強制觸發啟動本次輪詢");
-        } else {
-            debug!("由定時觸發啟動本次輪詢");
+        match trigger {
+            MonitorTrigger::ForcePoll => debug!("由強制觸發啟動本次輪詢"),
+            MonitorTrigger::Timer => debug!("由定時觸發啟動本次輪詢"),
+            MonitorTrigger::Reauth => {
+                info!("收到重新認證請求");
+                if let Err(e) = do_reauth(&mut ctx).await {
+                    error!(error = %e, "重新認證失敗");
+                    if let Some(bot) = &ctx.messenger {
+                        let target = ctx.adapter_target.lock().await.clone();
+                        let _ = bot
+                            .push_to_account_or_admin(
+                                &target,
+                                &OutboundMessage::Text(format!(
+                                    "❌ [{}] 重新認證失敗：{e}",
+                                    account_label
+                                )),
+                            )
+                            .await;
+                    }
+                } else {
+                    consecutive_failures = 0;
+                    if let Some(bot) = &ctx.messenger {
+                        let target = ctx.adapter_target.lock().await.clone();
+                        let _ = bot
+                            .push_to_account_or_admin(
+                                &target,
+                                &OutboundMessage::Text(format!(
+                                    "✅ [{}] 重新認證成功！",
+                                    account_label
+                                )),
+                            )
+                            .await;
+                    }
+                }
+                continue;
+            }
         }
 
-        if !triggered_by_force {
+        if trigger == MonitorTrigger::Timer {
             let now = Local::now();
             if !is_within_poll_window(&schedule, now.weekday(), now.time()) {
                 debug!("目前不在課堂輪詢時段內，略過本次定時觸發");
@@ -251,43 +297,6 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
             let is_running = *lock.lock().await;
             if !is_running {
                 debug!("監控已暫停，跳過本次輪詢");
-                continue;
-            }
-        }
-
-        // ── 檢查重新認證請求 ──────────────────────────────────────────────────
-        if let Some(ref notify) = reauth_notify {
-            // 非阻塞地嘗試接收通知
-            if let Ok(()) = tokio::time::timeout(Duration::from_millis(1), notify.notified()).await
-            {
-                info!("收到重新認證請求");
-                if let Err(e) = do_reauth(&mut ctx).await {
-                    error!(error = %e, "重新認證失敗");
-                    if let Some(bot) = &ctx.messenger {
-                        let _ = bot
-                            .push_to_user_or_admin(
-                                &ctx.account.line_user_id,
-                                &OutboundMessage::Text(format!(
-                                    "❌ [{}] 重新認證失敗：{e}",
-                                    account_label
-                                )),
-                            )
-                            .await;
-                    }
-                } else {
-                    consecutive_failures = 0;
-                    if let Some(bot) = &ctx.messenger {
-                        let _ = bot
-                            .push_to_user_or_admin(
-                                &ctx.account.line_user_id,
-                                &OutboundMessage::Text(format!(
-                                    "✅ [{}] 重新認證成功！",
-                                    account_label
-                                )),
-                            )
-                            .await;
-                    }
-                }
                 continue;
             }
         }
@@ -350,9 +359,10 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                     }
 
                     if let Some(bot) = &ctx.messenger {
+                        let target = ctx.adapter_target.lock().await.clone();
                         let _ = bot
-                            .push_to_user_or_admin(
-                                &ctx.account.line_user_id,
+                            .push_to_account_or_admin(
+                                &target,
                                 &OutboundMessage::Text(format!(
                                     "⚠️ [{}] 簽到監控遇到錯誤，嘗試重新認證...\n錯誤：{e}",
                                     account_label
@@ -370,9 +380,10 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                                 s.consecutive_failures = 0;
                             }
                             if let Some(bot) = &ctx.messenger {
+                                let target = ctx.adapter_target.lock().await.clone();
                                 let _ = bot
-                                    .push_to_user_or_admin(
-                                        &ctx.account.line_user_id,
+                                    .push_to_account_or_admin(
+                                        &target,
                                         &OutboundMessage::Text(format!(
                                             "✅ [{}] 自動重新認證成功！",
                                             account_label
@@ -384,9 +395,10 @@ pub async fn run_monitor_loop(mut ctx: MonitorContext) -> Result<()> {
                         Err(reauth_err) => {
                             error!(error = %reauth_err, "重新認證失敗！");
                             if let Some(bot) = &ctx.messenger {
+                                let target = ctx.adapter_target.lock().await.clone();
                                 let _ = bot
-                                    .push_to_user_or_admin(
-                                        &ctx.account.line_user_id,
+                                    .push_to_account_or_admin(
+                                        &target,
                                         &OutboundMessage::Text(format!(
                                             "❌ [{}] 自動重新認證失敗：{reauth_err}\n\n\
                                          請手動更新 accounts.toml 中對應帳號的 manual_cookie，\n\
@@ -480,6 +492,7 @@ async fn do_poll_and_attend(ctx: &mut MonitorContext) -> Result<BatchSummary> {
         &ctx.account,
         ctx.account.display_name(),
         messenger_ref,
+        Arc::clone(&ctx.adapter_target),
         ctx.request_account.as_ref().map(|_| Arc::clone(&ctx.qr_rx)),
         ctx.request_account.as_ref().map(|_| ctx.qr_tx.clone()),
         ctx.scanner_registry.as_ref().map(Arc::clone),
@@ -578,12 +591,20 @@ async fn do_reauth(ctx: &mut MonitorContext) -> Result<()> {
 /// 2. 強制觸發通知（`force_poll_notify`）
 ///
 /// # 返回
-/// `true` 如果是強制觸發，`false` 如果是定時觸發。
+/// 觸發來源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorTrigger {
+    Timer,
+    ForcePoll,
+    Reauth,
+}
+
 async fn wait_for_trigger(
     poll_interval: Duration,
     force_poll_notify: Option<&tokio::sync::Notify>,
+    reauth_notify: Option<&tokio::sync::Notify>,
     schedule: &PollingScheduleConfig,
-) -> bool {
+) -> MonitorTrigger {
     if let Some(next_window) =
         next_poll_window(schedule, Local::now().weekday(), Local::now().time())
     {
@@ -593,32 +614,40 @@ async fn wait_for_trigger(
             "目前不在課堂時段內，等待下一個輪詢時段"
         );
 
-        return match force_poll_notify {
-            Some(notify) => {
-                tokio::select! {
-                    _ = tokio::time::sleep(next_window.wait) => false,
-                    _ = notify.notified() => true,
-                }
-            }
-            None => {
-                tokio::time::sleep(next_window.wait).await;
-                false
-            }
-        };
+        return wait_for_duration(next_window.wait, force_poll_notify, reauth_notify).await;
     }
 
-    match force_poll_notify {
-        Some(notify) => {
-            // 同時等待定時器和強制通知
+    wait_for_duration(poll_interval, force_poll_notify, reauth_notify).await
+}
+
+async fn wait_for_duration(
+    duration: Duration,
+    force_poll_notify: Option<&tokio::sync::Notify>,
+    reauth_notify: Option<&tokio::sync::Notify>,
+) -> MonitorTrigger {
+    match (force_poll_notify, reauth_notify) {
+        (Some(force_notify), Some(reauth_notify)) => {
             tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => false,
-                _ = notify.notified() => true,
+                _ = tokio::time::sleep(duration) => MonitorTrigger::Timer,
+                _ = force_notify.notified() => MonitorTrigger::ForcePoll,
+                _ = reauth_notify.notified() => MonitorTrigger::Reauth,
             }
         }
-        None => {
-            // 沒有 Line Bot，只等定時器
-            tokio::time::sleep(poll_interval).await;
-            false
+        (Some(force_notify), None) => {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => MonitorTrigger::Timer,
+                _ = force_notify.notified() => MonitorTrigger::ForcePoll,
+            }
+        }
+        (None, Some(reauth_notify)) => {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => MonitorTrigger::Timer,
+                _ = reauth_notify.notified() => MonitorTrigger::Reauth,
+            }
+        }
+        (None, None) => {
+            tokio::time::sleep(duration).await;
+            MonitorTrigger::Timer
         }
     }
 }
@@ -795,8 +824,9 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_trigger_timeout() {
         let interval = Duration::from_millis(50);
-        let result = wait_for_trigger(interval, None, &PollingScheduleConfig::default()).await;
-        assert!(!result, "定時觸發應返回 false");
+        let result =
+            wait_for_trigger(interval, None, None, &PollingScheduleConfig::default()).await;
+        assert_eq!(result, MonitorTrigger::Timer, "應為定時觸發");
     }
 
     #[tokio::test]
@@ -811,9 +841,14 @@ mod tests {
             notify_clone.notify_one();
         });
 
-        let result =
-            wait_for_trigger(interval, Some(&notify), &PollingScheduleConfig::default()).await;
-        assert!(result, "強制觸發應返回 true");
+        let result = wait_for_trigger(
+            interval,
+            Some(&notify),
+            None,
+            &PollingScheduleConfig::default(),
+        )
+        .await;
+        assert_eq!(result, MonitorTrigger::ForcePoll, "應為強制觸發");
     }
 
     #[tokio::test]
@@ -830,12 +865,45 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let result =
-            wait_for_trigger(interval, Some(&notify), &PollingScheduleConfig::default()).await;
+        let result = wait_for_trigger(
+            interval,
+            Some(&notify),
+            None,
+            &PollingScheduleConfig::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         // 應該在 50ms 內返回（因為通知在 1ms 後觸發）
-        assert!(result, "應為強制觸發");
+        assert_eq!(result, MonitorTrigger::ForcePoll, "應為強制觸發");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "應在 50ms 內返回，實際：{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_trigger_reauth_interrupts_timer() {
+        let interval = Duration::from_secs(60); // 很長，確保不會先到期
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_clone = Arc::clone(&notify);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            notify_clone.notify_one();
+        });
+
+        let start = std::time::Instant::now();
+        let result = wait_for_trigger(
+            interval,
+            None,
+            Some(&notify),
+            &PollingScheduleConfig::default(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(result, MonitorTrigger::Reauth, "應為重新認證觸發");
         assert!(
             elapsed < Duration::from_millis(50),
             "應在 50ms 內返回，實際：{elapsed:?}"
@@ -846,10 +914,11 @@ mod tests {
     async fn test_wait_for_trigger_no_force_respects_interval() {
         let interval = Duration::from_millis(100);
         let start = std::time::Instant::now();
-        let result = wait_for_trigger(interval, None, &PollingScheduleConfig::default()).await;
+        let result =
+            wait_for_trigger(interval, None, None, &PollingScheduleConfig::default()).await;
         let elapsed = start.elapsed();
 
-        assert!(!result, "應為定時觸發");
+        assert_eq!(result, MonitorTrigger::Timer, "應為定時觸發");
         assert!(
             elapsed >= Duration::from_millis(90),
             "應等待至少 90ms，實際：{elapsed:?}"

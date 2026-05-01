@@ -45,7 +45,13 @@ enum AccountCmd {
         username: String,
         password: String,
         line_user_id: String,
+        discord_user_id: String,
         enabled: bool,
+    },
+    Bind {
+        id: String,
+        line_user_id: Option<String>,
+        discord_user_id: Option<String>,
     },
     Remove {
         id: String,
@@ -75,6 +81,7 @@ impl AccountCmd {
                 let mut username = String::new();
                 let mut password = String::new();
                 let mut line_user_id = String::new();
+                let mut discord_user_id = String::new();
                 let mut enabled = true;
                 *i += 1;
                 while *i < args.len() {
@@ -94,6 +101,10 @@ impl AccountCmd {
                         "--line-user-id" => {
                             *i += 1;
                             line_user_id = cli_require_value(args, *i, "--line-user-id");
+                        }
+                        "--discord-user-id" => {
+                            *i += 1;
+                            discord_user_id = cli_require_value(args, *i, "--discord-user-id");
                         }
                         "--disabled" => enabled = false,
                         other => {
@@ -121,7 +132,42 @@ impl AccountCmd {
                     username,
                     password,
                     line_user_id,
+                    discord_user_id,
                     enabled,
+                }
+            }
+            "bind" => {
+                *i += 1;
+                let id = cli_require_positional(args, *i, "bind", "<id>");
+                let mut line_user_id = None;
+                let mut discord_user_id = None;
+                *i += 1;
+                while *i < args.len() {
+                    match args[*i].as_str() {
+                        "--line-user-id" => {
+                            *i += 1;
+                            line_user_id = Some(cli_require_value(args, *i, "--line-user-id"));
+                        }
+                        "--discord-user-id" => {
+                            *i += 1;
+                            discord_user_id =
+                                Some(cli_require_value(args, *i, "--discord-user-id"));
+                        }
+                        other => {
+                            eprintln!("未知引數：{other}");
+                            std::process::exit(1);
+                        }
+                    }
+                    *i += 1;
+                }
+                if line_user_id.is_none() && discord_user_id.is_none() {
+                    eprintln!("錯誤：account bind 至少需要一個綁定參數");
+                    std::process::exit(1);
+                }
+                Self::Bind {
+                    id,
+                    line_user_id,
+                    discord_user_id,
                 }
             }
             "remove" => {
@@ -305,7 +351,11 @@ fn print_help() {
     println!("    -u, --username <user>      使用者名稱（必填）");
     println!("    -P, --password <pass>      密碼（必填）");
     println!("    --line-user-id <uid>       Line User ID（選填）");
+    println!("    --discord-user-id <id>     Discord User ID（選填）");
     println!("    --disabled                 新增時停用帳號");
+    println!("  account bind <id>           更新帳號的 adapter 使用者綁定");
+    println!("    --line-user-id <uid>       更新 Line User ID");
+    println!("    --discord-user-id <id>     更新 Discord User ID");
     println!("  account remove <id>        刪除帳號");
     println!("  account enable <id>        啟用帳號");
     println!("  account disable <id>       停用帳號");
@@ -358,18 +408,19 @@ async fn run_account_cmd(db: db::AccountsDb, cmd: AccountCmd) -> Result<()> {
                 println!("（沒有帳號）");
             } else {
                 println!(
-                    "{:<20} {:<12} {:<30} {:<8} {}",
-                    "ID", "Provider", "Username", "Enabled", "Line User ID"
+                    "{:<20} {:<12} {:<30} {:<8} {:<34} {}",
+                    "ID", "Provider", "Username", "Enabled", "Line User ID", "Discord User ID"
                 );
-                println!("{}", "─".repeat(88));
+                println!("{}", "─".repeat(124));
                 for a in &accounts {
                     println!(
-                        "{:<20} {:<12} {:<30} {:<8} {}",
+                        "{:<20} {:<12} {:<30} {:<8} {:<34} {}",
                         a.id,
                         a.provider,
                         a.username,
                         if a.enabled { "✓" } else { "✗" },
                         a.line_user_id,
+                        a.discord_user_id,
                     );
                 }
                 println!();
@@ -395,6 +446,14 @@ async fn run_account_cmd(db: db::AccountsDb, cmd: AccountCmd) -> Result<()> {
                         &a.line_user_id
                     }
                 );
+                println!(
+                    "Discord User ID: {}",
+                    if a.discord_user_id.is_empty() {
+                        "(未設定)"
+                    } else {
+                        &a.discord_user_id
+                    }
+                );
             }
         },
         AccountCmd::Add {
@@ -403,6 +462,7 @@ async fn run_account_cmd(db: db::AccountsDb, cmd: AccountCmd) -> Result<()> {
             username,
             password,
             line_user_id,
+            discord_user_id,
             enabled,
         } => {
             let account = RawAccountConfig {
@@ -412,9 +472,29 @@ async fn run_account_cmd(db: db::AccountsDb, cmd: AccountCmd) -> Result<()> {
                 password,
                 enabled,
                 line_user_id,
+                discord_user_id,
             };
             db.insert(&account).await?;
             println!("✅ 已新增帳號：{id}");
+        }
+        AccountCmd::Bind {
+            id,
+            line_user_id,
+            discord_user_id,
+        } => {
+            if let Some(value) = line_user_id {
+                if !db.set_line_user_id(&id, &value).await? {
+                    eprintln!("找不到帳號：{id}");
+                    std::process::exit(1);
+                }
+            }
+            if let Some(value) = discord_user_id {
+                if !db.set_discord_user_id(&id, &value).await? {
+                    eprintln!("找不到帳號：{id}");
+                    std::process::exit(1);
+                }
+            }
+            println!("✅ 已更新帳號綁定：{id}");
         }
         AccountCmd::Remove { id } => {
             if db.delete(&id).await? {
@@ -653,17 +733,46 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let discord_bot = if config.adapters.discord.enabled {
+        match adapters::discord::DiscordBotClient::new(&config.adapters.discord) {
+            Ok(bot) => Some(Arc::new(bot)),
+            Err(e) => {
+                warn!(error = %e, "Discord Bot 初始化失敗，將在無 Discord 模式下運行");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── 4. 建立監控器上下文 ────────────────────────────────────────────────────
     info!(account_count = accounts.len(), "初始化監控器...");
-    let adapter_messenger: Option<Arc<dyn adapters::events::AdapterMessenger>> = line_bot
-        .as_ref()
-        .map(|bot| Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>);
-    let interactive_line = adapter_messenger.is_some();
-    let scanner_registry = if interactive_line {
-        let public_base_url = config.adapters.line_bot.public_base_url.trim();
+    let mut adapter_messengers: Vec<Arc<dyn adapters::events::AdapterMessenger>> = vec![];
+    if let Some(bot) = line_bot.as_ref() {
+        adapter_messengers.push(Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>);
+    }
+    if let Some(bot) = discord_bot.as_ref() {
+        adapter_messengers.push(Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>);
+    }
+    let adapter_hub = if adapter_messengers.is_empty() {
+        None
+    } else {
+        Some(
+            Arc::new(adapters::events::AdapterHub::new(adapter_messengers))
+                as Arc<dyn adapters::events::AdapterMessenger>,
+        )
+    };
+    let interactive_adapter = adapter_hub.is_some();
+    let scanner_registry = if interactive_adapter {
+        let line_public_base_url = config.adapters.line_bot.public_base_url.trim();
+        let discord_public_base_url = config.adapters.discord.public_base_url.trim();
+        let public_base_url = if !line_public_base_url.is_empty() {
+            line_public_base_url
+        } else {
+            discord_public_base_url
+        };
         if public_base_url.is_empty() {
-            warn!("adapters.line_bot.public_base_url 未設定，QR Code 將沿用 legacy scanner URL");
+            warn!("scanner public_base_url 未設定，QR Code 將沿用 legacy scanner URL");
             None
         } else {
             Some(Arc::new(adapters::scanner::QrScannerRegistry::new(
@@ -680,8 +789,8 @@ async fn main() -> Result<()> {
         let ctx = match monitor::MonitorContext::new(
             Arc::clone(&config),
             Arc::clone(&account),
-            adapter_messenger.as_ref().map(Arc::clone),
-            interactive_line,
+            adapter_hub.as_ref().map(Arc::clone),
+            interactive_adapter,
             scanner_registry.as_ref().map(Arc::clone),
         )
         .await
@@ -697,18 +806,16 @@ async fn main() -> Result<()> {
     }
 
     // ── 5. 啟動 Webhook 伺服器（背景任務） ───────────────────────────────────
-    let webhook_handle = if interactive_line {
+    let webhook_accounts = contexts
+        .iter()
+        .filter_map(|ctx| ctx.request_account.clone())
+        .collect::<Vec<_>>();
+
+    let webhook_handle = if line_bot.is_some() {
         if let Some(bot) = line_bot.as_ref() {
-            let webhook_accounts = contexts
-                .iter()
-                .filter_map(|ctx| ctx.request_account.clone())
-                .collect::<Vec<_>>();
             let request_state = adapters::requests::RequestState::new(
-                adapter_messenger
-                    .as_ref()
-                    .map(Arc::clone)
-                    .expect("interactive adapter has messenger"),
-                webhook_accounts,
+                Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>,
+                webhook_accounts.clone(),
             );
             let webhook_state = adapters::line::webhook::LineWebhookState::new(
                 Arc::clone(bot),
@@ -741,7 +848,47 @@ async fn main() -> Result<()> {
             None
         }
     } else {
-        info!("目前模式未啟用 Webhook 伺服器");
+        info!("Line Bot 未啟用，跳過 Webhook 伺服器");
+        None
+    };
+
+    let scanner_handle = if line_bot.is_none() {
+        if let Some(scanner) = scanner_registry.as_ref() {
+            let scanner = Arc::clone(scanner);
+            let port = config.adapters.line_bot.webhook_port;
+            info!(port = port, "啟動共用 QR scanner 伺服器...");
+            Some(tokio::spawn(async move {
+                if let Err(e) = adapters::scanner::start_scanner_server(scanner, port).await {
+                    error!(error = %e, "QR scanner 伺服器異常退出");
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let discord_handle = if let Some(bot) = discord_bot.as_ref() {
+        let request_state = adapters::requests::RequestState::new_with_binding(
+            Arc::clone(bot) as Arc<dyn adapters::events::AdapterMessenger>,
+            webhook_accounts.clone(),
+            adapters::requests::AdapterBindingKind::Discord,
+        );
+        let runtime = adapters::discord::DiscordRuntime::new(
+            Arc::clone(bot),
+            request_state,
+            accounts_db.clone(),
+            &config.adapters.discord,
+        );
+
+        info!("啟動 Discord Bot...");
+        Some(tokio::spawn(async move {
+            if let Err(e) = adapters::discord::start_discord_bot(runtime).await {
+                error!(error = %e, "Discord Bot 異常退出");
+            }
+        }))
+    } else {
         None
     };
 
@@ -809,6 +956,16 @@ async fn main() -> Result<()> {
     if let Some(handle) = webhook_handle {
         handle.abort();
         info!("Webhook 伺服器已關閉");
+    }
+
+    if let Some(handle) = scanner_handle {
+        handle.abort();
+        info!("QR scanner 伺服器已關閉");
+    }
+
+    if let Some(handle) = discord_handle {
+        handle.abort();
+        info!("Discord Bot 已關閉");
     }
 
     info!("👋 {} 已關閉，再見！", PKG_NAME);

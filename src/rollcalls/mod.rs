@@ -13,11 +13,13 @@ pub mod radar;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::account::AccountConfig;
 use crate::adapters::events::{
-    AdapterMessenger, OutboundMessage, QrCodeRequest, RollcallEvent, RollcallResultEvent,
+    AdapterAccountTarget, AdapterMessenger, OutboundMessage, QrCodeRequest, RollcallEvent,
+    RollcallResultEvent,
 };
 use crate::adapters::requests::{QrCodeReceiver, QrCodeSender};
 use crate::adapters::scanner::QrScannerRegistry;
@@ -136,6 +138,7 @@ pub async fn process_rollcall(
     config: &AccountConfig,
     account_label: &str,
     messenger: Option<&dyn AdapterMessenger>,
+    adapter_target: Arc<Mutex<AdapterAccountTarget>>,
     qr_rx: Option<QrCodeReceiver>,
     qr_tx: Option<QrCodeSender>,
     scanner_registry: Option<Arc<QrScannerRegistry>>,
@@ -205,7 +208,8 @@ pub async fn process_rollcall(
             teacher_name: rollcall.created_by_name.clone(),
             attendance_type: attendance_type.to_string(),
         });
-        if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
+        let target = adapter_target.lock().await.clone();
+        if let Err(e) = bot.push_to_account_or_admin(&target, &msg).await {
             warn!(error = %e, "發送 Line 開始通知失敗");
         }
     }
@@ -221,6 +225,7 @@ pub async fn process_rollcall(
                 config,
                 account_label,
                 messenger,
+                Arc::clone(&adapter_target),
                 qr_rx,
                 qr_tx,
                 scanner_registry,
@@ -242,7 +247,8 @@ pub async fn process_rollcall(
             result: result.to_string(),
             elapsed_ms,
         });
-        if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
+        let target = adapter_target.lock().await.clone();
+        if let Err(e) = bot.push_to_account_or_admin(&target, &msg).await {
             warn!(error = %e, "發送 Line 結果通知失敗");
         }
     }
@@ -358,6 +364,7 @@ async fn handle_qrcode_rollcall(
     config: &AccountConfig,
     account_label: &str,
     messenger: Option<&dyn AdapterMessenger>,
+    adapter_target: Arc<Mutex<AdapterAccountTarget>>,
     qr_rx: Option<QrCodeReceiver>,
     qr_tx: Option<QrCodeSender>,
     scanner_registry: Option<Arc<QrScannerRegistry>>,
@@ -416,7 +423,8 @@ async fn handle_qrcode_rollcall(
         });
 
         if !scanner_already_submitted {
-            if let Err(e) = bot.push_to_user_or_admin(&config.line_user_id, &msg).await {
+            let target = adapter_target.lock().await.clone();
+            if let Err(e) = bot.push_to_account_or_admin(&target, &msg).await {
                 warn!(error = %e, "發送 QR Code 請求通知失敗");
             }
         }
@@ -536,6 +544,7 @@ pub async fn process_rollcall_batch(
     config: &AccountConfig,
     account_label: &str,
     messenger: Option<&dyn AdapterMessenger>,
+    adapter_target: Arc<Mutex<AdapterAccountTarget>>,
     qr_rx: Option<QrCodeReceiver>,
     qr_tx: Option<QrCodeSender>,
     scanner_registry: Option<Arc<QrScannerRegistry>>,
@@ -584,6 +593,7 @@ pub async fn process_rollcall_batch(
             config,
             account_label,
             messenger,
+            Arc::clone(&adapter_target),
             qr_rx.clone(),
             qr_tx.clone(),
             scanner_registry.clone(),

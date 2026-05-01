@@ -16,6 +16,7 @@ pub struct AccountConfig {
     pub password: String,
     pub enabled: bool,
     pub line_user_id: String,
+    pub discord_user_id: String,
     pub provider_config: ProviderConfig,
     pub request_timeout_secs: u64,
 }
@@ -45,6 +46,9 @@ pub struct RawAccountConfig {
 
     #[serde(default)]
     pub line_user_id: String,
+
+    #[serde(default)]
+    pub discord_user_id: String,
 }
 
 fn default_true() -> bool {
@@ -110,6 +114,7 @@ impl AccountsFile {
                 password: account.password.clone(),
                 enabled: account.enabled,
                 line_user_id: account.line_user_id.clone(),
+                discord_user_id: account.discord_user_id.clone(),
                 provider_config: provider,
                 request_timeout_secs,
             });

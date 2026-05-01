@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.2] - 2026-05-01
+
+### Added
+
+- Added a Discord Bot adapter with slash commands, DM status/help/QR handling, admin dashboard notifications, and account request approval buttons.
+- Added `[adapters.discord]` configuration for bot credentials, admin routing, scanner public URLs, slash command registration, and optional guild-scoped command registration.
+- Added Discord user bindings to accounts, the SQLite account database, account list/show output, `account add --discord-user-id`, and `account bind`.
+- Added adapter fan-out delivery so enabled Line and Discord adapters can both receive monitor, rollcall, QR Code, and result notifications.
+- Added a standalone QR scanner HTTP server for deployments that use Discord without the Line webhook server.
+
+### Changed
+
+- Route account notifications through per-adapter account targets, using Discord bindings for Discord delivery and Line bindings for Line delivery.
+- Allow `/reauth` requests to interrupt the monitor wait loop immediately instead of waiting for the next polling tick.
+- Treat ambiguous number-rollcall API responses as transient failures unless the response body clearly confirms success or a wrong code.
+
+### Fixed
+
+- Migrated existing account databases by adding the missing `discord_user_id` column on startup.
+- Kept Discord username binding by Tronclass username safe when the same username exists under multiple providers by reporting ambiguity unless a provider is supplied.
+
 ## [0.1.1] - 2026-04-24
 
 ### Added

@@ -253,6 +253,8 @@ impl ScheduleWeekday {
 pub struct AdapterConfig {
     #[serde(default)]
     pub line_bot: LineBotConfig,
+    #[serde(default)]
+    pub discord: DiscordBotConfig,
 }
 
 /// Line Bot 設定
@@ -290,6 +292,45 @@ impl Default for LineBotConfig {
             webhook_path: default_webhook_path(),
             public_base_url: String::new(),
             admin_user_id: String::new(),
+        }
+    }
+}
+
+/// Discord Bot 設定
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscordBotConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub bot_token: String,
+
+    #[serde(default)]
+    pub admin_user_id: String,
+
+    #[serde(default)]
+    pub admin_channel_id: String,
+
+    #[serde(default)]
+    pub public_base_url: String,
+
+    #[serde(default = "default_register_commands")]
+    pub register_commands: bool,
+
+    #[serde(default)]
+    pub guild_ids: Vec<String>,
+}
+
+impl Default for DiscordBotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            admin_user_id: String::new(),
+            admin_channel_id: String::new(),
+            public_base_url: String::new(),
+            register_commands: default_register_commands(),
+            guild_ids: vec![],
         }
     }
 }
@@ -387,6 +428,9 @@ fn default_webhook_port() -> u16 {
 }
 fn default_webhook_path() -> String {
     "/webhook".to_string()
+}
+fn default_register_commands() -> bool {
+    true
 }
 fn default_log_level() -> String {
     "info".to_string()
@@ -540,6 +584,41 @@ impl AppConfig {
             }
         }
 
+        if self.adapters.discord.enabled {
+            if self.adapters.discord.bot_token.trim().is_empty() {
+                return Err(miette::miette!(
+                    "adapters.discord.bot_token 不可為空（discord.enabled = true）"
+                ));
+            }
+            if self.adapters.discord.admin_user_id.trim().is_empty() {
+                return Err(miette::miette!(
+                    "adapters.discord.admin_user_id 不可為空（discord.enabled = true）"
+                ));
+            }
+            if self.adapters.discord.admin_channel_id.trim().is_empty() {
+                return Err(miette::miette!(
+                    "adapters.discord.admin_channel_id 不可為空（discord.enabled = true）"
+                ));
+            }
+            validate_discord_id(
+                "adapters.discord.admin_user_id",
+                &self.adapters.discord.admin_user_id,
+            )?;
+            validate_discord_id(
+                "adapters.discord.admin_channel_id",
+                &self.adapters.discord.admin_channel_id,
+            )?;
+            for (i, guild_id) in self.adapters.discord.guild_ids.iter().enumerate() {
+                validate_discord_id(&format!("adapters.discord.guild_ids[{i}]"), guild_id)?;
+            }
+        }
+        if !self.adapters.discord.public_base_url.trim().is_empty() {
+            validate_http_url(
+                "adapters.discord.public_base_url",
+                self.adapters.discord.public_base_url.trim(),
+            )?;
+        }
+
         if self.monitor.retry_interval_secs == 0 {
             return Err(miette::miette!("monitor.retry_interval_secs 必須大於 0"));
         }
@@ -560,11 +639,31 @@ impl std::fmt::Display for AppConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "AppConfig {{ providers: {}, line_bot.enabled: {} }}",
+            "AppConfig {{ providers: {}, line_bot.enabled: {}, discord.enabled: {} }}",
             self.providers.len(),
             self.adapters.line_bot.enabled,
+            self.adapters.discord.enabled,
         )
     }
+}
+
+fn validate_discord_id(field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return Err(miette::miette!("{field} 必須是 Discord snowflake 數字 ID"));
+    }
+
+    Ok(())
+}
+
+fn validate_http_url(field: &str, value: &str) -> Result<()> {
+    let parsed =
+        url::Url::parse(value).map_err(|_| miette::miette!("{field} 必須是有效的 http(s) URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(miette::miette!("{field} 必須是有效的 http(s) URL"));
+    }
+
+    Ok(())
 }
 
 pub(crate) fn parse_hhmm(value: &str) -> Result<NaiveTime> {
@@ -771,6 +870,18 @@ mod tests {
         assert!(lb.public_base_url.is_empty());
     }
 
+    #[test]
+    fn test_discord_bot_config_defaults() {
+        let discord = DiscordBotConfig::default();
+        assert!(!discord.enabled);
+        assert!(discord.bot_token.is_empty());
+        assert!(discord.admin_user_id.is_empty());
+        assert!(discord.admin_channel_id.is_empty());
+        assert!(discord.public_base_url.is_empty());
+        assert!(discord.register_commands);
+        assert!(discord.guild_ids.is_empty());
+    }
+
     // ── Line Bot loading ──────────────────────────────────────────────────────
 
     #[test]
@@ -814,6 +925,35 @@ mod tests {
         let cfg = AppConfig::load(f.path()).unwrap();
         assert_eq!(cfg.adapters.line_bot.webhook_port, 9090);
         assert_eq!(cfg.adapters.line_bot.webhook_path, "/line");
+    }
+
+    #[test]
+    fn test_load_with_discord_enabled() {
+        let toml = format!(
+            "{}\n\
+             [adapters.discord]\n\
+             enabled = true\n\
+             bot_token = \"token\"\n\
+             admin_user_id = \"123\"\n\
+             admin_channel_id = \"456\"\n\
+             public_base_url = \"https://discord-scanner.example.test\"\n\
+             register_commands = false\n\
+             guild_ids = [\"789\"]\n",
+            minimal_toml()
+        );
+        let f = write_toml(&toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        assert!(cfg.adapters.discord.enabled);
+        assert_eq!(cfg.adapters.discord.bot_token, "token");
+        assert_eq!(cfg.adapters.discord.admin_user_id, "123");
+        assert_eq!(cfg.adapters.discord.admin_channel_id, "456");
+        assert_eq!(
+            cfg.adapters.discord.public_base_url,
+            "https://discord-scanner.example.test"
+        );
+        assert!(!cfg.adapters.discord.register_commands);
+        assert_eq!(cfg.adapters.discord.guild_ids, vec!["789".to_string()]);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -1158,6 +1298,27 @@ rest_weekdays = ["sun", "sun"]
     }
 
     #[test]
+    fn test_validate_fails_when_discord_enabled_without_credentials() {
+        let toml = format!("{}\n[adapters.discord]\nenabled = true\n", minimal_toml());
+        let f = write_toml(&toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("bot_token"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_discord_id() {
+        let toml = format!(
+            "{}\n[adapters.discord]\nenabled = true\nbot_token = \"t\"\nadmin_user_id = \"not-id\"\nadmin_channel_id = \"456\"\n",
+            minimal_toml()
+        );
+        let f = write_toml(&toml);
+        let cfg = AppConfig::load(f.path()).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("snowflake"), "got: {err}");
+    }
+
+    #[test]
     fn test_validate_rejects_invalid_public_base_url() {
         let toml = format!(
             "{}\n[adapters.line_bot]\nenabled = true\nchannel_secret = \"s\"\nchannel_access_token = \"t\"\nadmin_user_id = \"u\"\npublic_base_url = \"not a url\"\n",
@@ -1219,6 +1380,7 @@ rest_weekdays = ["sun", "sun"]
         let s = format!("{cfg}");
         assert!(s.contains("providers: 1"), "got: {s}");
         assert!(s.contains("line_bot.enabled: false"), "got: {s}");
+        assert!(s.contains("discord.enabled: false"), "got: {s}");
     }
 
     #[test]

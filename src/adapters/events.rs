@@ -7,6 +7,29 @@
 use async_trait::async_trait;
 use miette::Result;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+/// Per-account adapter delivery targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdapterAccountTarget {
+    pub account_id: String,
+    pub line_user_id: String,
+    pub discord_user_id: String,
+}
+
+impl AdapterAccountTarget {
+    pub fn new(
+        account_id: impl Into<String>,
+        line_user_id: impl Into<String>,
+        discord_user_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            line_user_id: line_user_id.into(),
+            discord_user_id: discord_user_id.into(),
+        }
+    }
+}
 
 /// Common messaging capability implemented by concrete adapters.
 #[async_trait]
@@ -31,6 +54,74 @@ pub trait AdapterMessenger: Send + Sync {
         };
 
         self.push(to, message).await
+    }
+
+    async fn push_to_account_or_admin(
+        &self,
+        target: &AdapterAccountTarget,
+        message: &OutboundMessage,
+    ) -> Result<()> {
+        self.push_to_user_or_admin(&target.line_user_id, message)
+            .await
+    }
+}
+
+/// Fan-out messenger used by monitor/rollcall flows when multiple adapters are enabled.
+pub struct AdapterHub {
+    messengers: Vec<std::sync::Arc<dyn AdapterMessenger>>,
+}
+
+impl AdapterHub {
+    pub fn new(messengers: Vec<std::sync::Arc<dyn AdapterMessenger>>) -> Self {
+        Self { messengers }
+    }
+}
+
+#[async_trait]
+impl AdapterMessenger for AdapterHub {
+    fn adapter_name(&self) -> &'static str {
+        "hub"
+    }
+
+    fn admin_user_id(&self) -> &str {
+        ""
+    }
+
+    async fn reply(&self, _reply_token: &str, _message: &OutboundMessage) -> Result<()> {
+        Err(miette::miette!(
+            "AdapterHub 不支援 reply；請使用具體 adapter"
+        ))
+    }
+
+    async fn push(&self, to: &str, message: &OutboundMessage) -> Result<()> {
+        for messenger in &self.messengers {
+            if let Err(e) = messenger.push(to, message).await {
+                warn!(
+                    adapter = messenger.adapter_name(),
+                    error = %e,
+                    "adapter hub push 失敗"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn push_to_account_or_admin(
+        &self,
+        target: &AdapterAccountTarget,
+        message: &OutboundMessage,
+    ) -> Result<()> {
+        for messenger in &self.messengers {
+            if let Err(e) = messenger.push_to_account_or_admin(target, message).await {
+                warn!(
+                    adapter = messenger.adapter_name(),
+                    account = %target.account_id,
+                    error = %e,
+                    "adapter hub account push 失敗"
+                );
+            }
+        }
+        Ok(())
     }
 }
 

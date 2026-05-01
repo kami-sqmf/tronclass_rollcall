@@ -219,6 +219,35 @@ QR Code 簽到時，若設定 `public_base_url`，通知中的「開啟掃碼頁
 
 管理員可查詢所有帳號狀態，並可使用 `/start`、`/stop`、`/force`、`/reauth` 控制全部監控帳號。非管理員只能透過 `/status` 或傳送貼圖查詢自己 `line_user_id` 綁定的 Tronclass 帳號狀態；控制指令仍限管理員使用。當系統偵測到綁定帳號需要簽到時，開始通知、QR Code 掃碼請求與簽到結果會優先推送到該 `line_user_id`，未綁定才會退回管理員；帳號啟動、重新認證成功或失敗等系統通知也走同樣規則。Webhook 只處理個人對話來源的訊息與 postback，群組或多人聊天室事件會被忽略。
 
+### Discord Bot
+
+啟用 Discord Bot：
+
+```toml
+[adapters.discord]
+enabled = true
+bot_token = "your_discord_bot_token"
+admin_user_id = "123456789012345678"
+admin_channel_id = "123456789012345678"
+public_base_url = "https://your-discord-scanner-domain.example"
+register_commands = true
+guild_ids = []
+```
+
+帳號可在新增時綁定 Discord 使用者，或稍後由 CLI 更新：
+
+```sh
+cargo run -- account add my-account \
+  --provider fju \
+  --username "student_id" \
+  --password "password" \
+  --discord-user-id "123456789012345678"
+
+cargo run -- account bind my-account --discord-user-id "123456789012345678"
+```
+
+Discord 一般互動走使用者 DM；使用者可用 `/status`、`/help`、`/qr data:<資料>` 或直接貼 QR Code URL/data，也可在 DM 使用 `/request-account provider:<name> username:<Tronclass username> password:<password>` 申請新增帳號。申請會送到 `admin_channel_id`，管理員用訊息按鈕核准或拒絕；控制台訊息不會顯示密碼。`admin_channel_id` 是管理看板與控制台，會收到啟動、簽到偵測、QR request、簽到結果與錯誤通知。管理員可在該 channel 或 DM 使用 `/start`、`/stop`、`/force`、`/reauth`，也可用 `/add-account provider:<name> username:<Tronclass username> password:<password> user:<Discord user>` 新增帳號。既有帳號綁定使用 Tronclass username：`/bind-account username:<Tronclass username> user:<Discord user>`、`/unbind-account username:<Tronclass username>`、`/bindings`；綁定會寫入 `accounts.db` 並立即套用到目前執行中的監控。若同一個 username 對應多個 provider，請在 bind/unbind 指令加上 `provider` 參數消除歧義。新增帳號會寫入 DB，監控任務會在下一次啟動後載入。
+
 ### Adapter 雙向互動訊息流程
 
 訊息互動分成兩條主線：系統透過 adapter 主動推送通知，以及使用者透過 adapter webhook 回傳指令或 QR Code。`adapters/line` 只負責 LINE API、Webhook 入口與 payload 轉換；`adapters/events` 定義 adapter-neutral 的對外事件內容，讓各 adapter 自行渲染成文字、按鈕或 template；`adapters/requests` 處理 adapter 傳回來的使用者請求、權限、狀態查詢與 QR Code 等待輸入通道。

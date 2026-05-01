@@ -253,6 +253,209 @@ impl AttendanceResult {
     }
 }
 
+const NUMBER_RESULT_BOOL_KEYS: &[&str] = &["success", "succeeded", "ok", "result"];
+const NUMBER_RESULT_TEXT_KEYS: &[&str] = &[
+    "message",
+    "msg",
+    "error",
+    "errors",
+    "reason",
+    "detail",
+    "details",
+    "code",
+    "status",
+    "state",
+    "result",
+    "attendance_status",
+    "attendanceStatus",
+    "rollcall_status",
+    "rollcallStatus",
+];
+const RESPONSE_BODY_PREVIEW_CHARS: usize = 300;
+
+fn classify_number_rollcall_response(
+    status: StatusCode,
+    body_text: &str,
+    number_code: &str,
+) -> AttendanceResult {
+    if status == StatusCode::NO_CONTENT {
+        return AttendanceResult::Success;
+    }
+
+    let body = body_text.trim();
+    if body.is_empty() {
+        if status == StatusCode::CREATED {
+            return AttendanceResult::Success;
+        }
+
+        return AttendanceResult::TransientFailure {
+            reason: format!(
+                "HTTP {status}: 數字簽到回應為空，無法確認 code {number_code} 是否正確"
+            ),
+        };
+    }
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        if number_json_bool_marker(&json, false) {
+            return AttendanceResult::Failed {
+                reason: format!("code {number_code} 不正確（回應標示 success=false）"),
+            };
+        }
+
+        if let Some(reason) = find_number_response_text(&json, is_number_failure_text) {
+            return AttendanceResult::Failed {
+                reason: format!("code {number_code} 不正確：{reason}"),
+            };
+        }
+
+        if number_json_bool_marker(&json, true)
+            || find_number_response_text(&json, is_number_success_text).is_some()
+        {
+            return AttendanceResult::Success;
+        }
+
+        return unverified_number_rollcall_response(status, body);
+    }
+
+    if is_number_failure_text(body) {
+        return AttendanceResult::Failed {
+            reason: format!("code {number_code} 不正確：{body}"),
+        };
+    }
+
+    if is_number_success_text(body) {
+        return AttendanceResult::Success;
+    }
+
+    unverified_number_rollcall_response(status, body)
+}
+
+fn unverified_number_rollcall_response(status: StatusCode, body: &str) -> AttendanceResult {
+    AttendanceResult::TransientFailure {
+        reason: format!(
+            "HTTP {status}: 數字簽到回應無法確認成功：{}",
+            response_body_preview(body)
+        ),
+    }
+}
+
+fn number_json_bool_marker(value: &serde_json::Value, expected: bool) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            (key_matches(key, NUMBER_RESULT_BOOL_KEYS) && value.as_bool() == Some(expected))
+                || number_json_bool_marker(value, expected)
+        }),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|value| number_json_bool_marker(value, expected)),
+        _ => false,
+    }
+}
+
+fn find_number_response_text(
+    value: &serde_json::Value,
+    predicate: fn(&str) -> bool,
+) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if predicate(text) => Some(text.clone()),
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key_matches(key, NUMBER_RESULT_TEXT_KEYS) {
+                    if let Some(text) = find_text_in_json(value, predicate) {
+                        return Some(text);
+                    }
+                }
+            }
+
+            map.values()
+                .find_map(|value| find_number_response_text(value, predicate))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|value| find_number_response_text(value, predicate)),
+        _ => None,
+    }
+}
+
+fn find_text_in_json(value: &serde_json::Value, predicate: fn(&str) -> bool) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if predicate(text) => Some(text.clone()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|value| find_text_in_json(value, predicate)),
+        serde_json::Value::Object(map) => map
+            .values()
+            .find_map(|value| find_text_in_json(value, predicate)),
+        _ => None,
+    }
+}
+
+fn key_matches(key: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+}
+
+fn is_number_failure_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let normalized = lower.trim();
+
+    matches!(
+        normalized,
+        "false" | "fail" | "failed" | "failure" | "error" | "incorrect" | "wrong" | "invalid"
+    ) || lower.contains("incorrect")
+        || lower.contains("wrong")
+        || lower.contains("invalid")
+        || lower.contains("not match")
+        || lower.contains("not_match")
+        || lower.contains("number_code")
+        || lower.contains("number code")
+        || lower.contains("rollcall number")
+        || lower.contains("failed")
+        || lower.contains("failure")
+        || lower.contains("expired")
+        || text.contains("錯")
+        || text.contains("不正確")
+        || text.contains("失敗")
+        || text.contains("無效")
+        || text.contains("已過期")
+        || text.contains("已結束")
+}
+
+fn is_number_success_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let normalized = lower.trim();
+
+    matches!(
+        normalized,
+        "true"
+            | "success"
+            | "succeeded"
+            | "ok"
+            | "attended"
+            | "on_call_fine"
+            | "checked_in"
+            | "checked-in"
+    ) || lower.contains("on_call_fine")
+        || text.contains("簽到成功")
+        || text.contains("签到成功")
+        || text.contains("點名成功")
+        || text.contains("点名成功")
+        || text.contains("已簽到")
+        || text.contains("已签到")
+}
+
+fn response_body_preview(body: &str) -> String {
+    let trimmed = body.trim();
+    let mut chars = trimmed.chars();
+    let preview: String = chars.by_ref().take(RESPONSE_BODY_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 // ─── ApiClient 簽到方法 ───────────────────────────────────────────────────────
 
 impl super::ApiClient {
@@ -302,8 +505,41 @@ impl super::ApiClient {
         let status = resp.status();
         match status {
             StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT => {
-                debug!(code = %number_code, "數字簽到成功");
-                Ok(AttendanceResult::Success)
+                let body_text = resp.text().await.unwrap_or_default();
+                let result = classify_number_rollcall_response(status, &body_text, number_code);
+                let body_preview = response_body_preview(&body_text);
+
+                match &result {
+                    AttendanceResult::Success => {
+                        debug!(
+                            code = %number_code,
+                            status = %status,
+                            body = %body_preview,
+                            "數字簽到成功"
+                        );
+                    }
+                    AttendanceResult::Failed { reason } => {
+                        debug!(
+                            code = %number_code,
+                            status = %status,
+                            body = %body_preview,
+                            reason = %reason,
+                            "數字代碼錯誤"
+                        );
+                    }
+                    AttendanceResult::TransientFailure { reason } => {
+                        warn!(
+                            code = %number_code,
+                            status = %status,
+                            body = %body_preview,
+                            reason = %reason,
+                            "數字簽到 2xx 回應無法確認成功"
+                        );
+                    }
+                    AttendanceResult::RadarTooFar { .. } => {}
+                }
+
+                Ok(result)
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 Err(miette::miette!(ApiError::Unauthorized))
@@ -573,6 +809,56 @@ mod tests {
     }
 
     #[test]
+    fn test_number_rollcall_response_success_json() {
+        let result =
+            classify_number_rollcall_response(StatusCode::OK, r#"{"success":true}"#, "0042");
+        assert!(result.is_success());
+
+        let result = classify_number_rollcall_response(
+            StatusCode::OK,
+            r#"{"rollcall":{"status":"on_call_fine"}}"#,
+            "0042",
+        );
+        assert!(result.is_success());
+    }
+
+    #[test]
+    fn test_number_rollcall_response_wrong_code_with_200_json() {
+        let result = classify_number_rollcall_response(
+            StatusCode::OK,
+            r#"{"success":false,"message":"number code incorrect"}"#,
+            "0042",
+        );
+        assert_number_failed(result);
+
+        let result = classify_number_rollcall_response(
+            StatusCode::OK,
+            r#"{"message":"驗證碼錯誤"}"#,
+            "0042",
+        );
+        assert_number_failed(result);
+    }
+
+    #[test]
+    fn test_number_rollcall_response_unverified_200_is_transient() {
+        let result = classify_number_rollcall_response(
+            StatusCode::OK,
+            r#"{"message":"request accepted"}"#,
+            "0042",
+        );
+        assert_number_transient(result);
+
+        let result = classify_number_rollcall_response(StatusCode::OK, "", "0042");
+        assert_number_transient(result);
+    }
+
+    #[test]
+    fn test_number_rollcall_no_content_success() {
+        let result = classify_number_rollcall_response(StatusCode::NO_CONTENT, "", "0042");
+        assert!(result.is_success());
+    }
+
+    #[test]
     fn test_attendance_result_is_success() {
         assert!(AttendanceResult::Success.is_success());
         assert!(!AttendanceResult::RadarTooFar { distance: 10.0 }.is_success());
@@ -607,6 +893,20 @@ mod tests {
             status: "absent".to_string(),
             rollcall_status: "ongoing".to_string(),
             scored: false,
+        }
+    }
+
+    fn assert_number_failed(result: AttendanceResult) {
+        match result {
+            AttendanceResult::Failed { .. } => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    fn assert_number_transient(result: AttendanceResult) {
+        match result {
+            AttendanceResult::TransientFailure { .. } => {}
+            other => panic!("expected TransientFailure, got {other:?}"),
         }
     }
 }

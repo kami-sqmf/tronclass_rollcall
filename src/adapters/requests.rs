@@ -11,12 +11,20 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, instrument, warn};
 
 use crate::adapters::events::{
-    AccountStatusMessage, AdapterMessenger, MonitorStatus, OutboundMessage, StatusMessage,
+    AccountStatusMessage, AdapterAccountTarget, AdapterMessenger, MonitorStatus, OutboundMessage,
+    StatusMessage,
 };
 
 /// QR Code input sent by an adapter and consumed by the QR Code rollcall flow.
 pub type QrCodeSender = mpsc::Sender<String>;
 pub type QrCodeReceiver = Arc<Mutex<mpsc::Receiver<String>>>;
+
+/// Which per-account platform binding a `RequestState` should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterBindingKind {
+    Line,
+    Discord,
+}
 
 /// Per-account request channels exposed to adapter event handlers.
 #[derive(Clone)]
@@ -147,7 +155,8 @@ impl std::fmt::Display for RequestCommand {
 #[derive(Clone)]
 pub struct RequestAccountState {
     pub account_id: String,
-    pub user_id: String,
+    pub username: String,
+    pub target: Arc<Mutex<AdapterAccountTarget>>,
     pub requests: RequestChannels,
     pub monitor_status: Arc<Mutex<MonitorStatus>>,
     pub is_running: Arc<Mutex<bool>>,
@@ -162,9 +171,28 @@ impl RequestAccountState {
         qr_tx: QrCodeSender,
         monitor_status: Arc<Mutex<MonitorStatus>>,
     ) -> Self {
+        let account_id = account_id.into();
+        let target = AdapterAccountTarget::new(account_id.clone(), user_id, "");
+        Self::new_with_target(
+            account_id,
+            "",
+            Arc::new(Mutex::new(target)),
+            qr_tx,
+            monitor_status,
+        )
+    }
+
+    pub fn new_with_target(
+        account_id: impl Into<String>,
+        username: impl Into<String>,
+        target: Arc<Mutex<AdapterAccountTarget>>,
+        qr_tx: QrCodeSender,
+        monitor_status: Arc<Mutex<MonitorStatus>>,
+    ) -> Self {
         Self {
             account_id: account_id.into(),
-            user_id: user_id.into(),
+            username: username.into(),
+            target,
             requests: RequestChannels::new(qr_tx),
             monitor_status,
             is_running: Arc::new(Mutex::new(true)),
@@ -179,13 +207,23 @@ impl RequestAccountState {
 pub struct RequestState {
     pub messenger: Arc<dyn AdapterMessenger>,
     pub accounts: Arc<Vec<RequestAccountState>>,
+    pub binding_kind: AdapterBindingKind,
 }
 
 impl RequestState {
     pub fn new(messenger: Arc<dyn AdapterMessenger>, accounts: Vec<RequestAccountState>) -> Self {
+        Self::new_with_binding(messenger, accounts, AdapterBindingKind::Line)
+    }
+
+    pub fn new_with_binding(
+        messenger: Arc<dyn AdapterMessenger>,
+        accounts: Vec<RequestAccountState>,
+        binding_kind: AdapterBindingKind,
+    ) -> Self {
         Self {
             messenger,
             accounts: Arc::new(accounts),
+            binding_kind,
         }
     }
 
@@ -193,14 +231,23 @@ impl RequestState {
         self.accounts.first()
     }
 
-    fn account_for_user(&self, user_id: &str) -> Option<&RequestAccountState> {
+    async fn account_for_user(&self, user_id: &str) -> Option<&RequestAccountState> {
         if user_id.is_empty() {
             return None;
         }
 
-        self.accounts
-            .iter()
-            .find(|account| !account.user_id.is_empty() && account.user_id == user_id)
+        for account in self.accounts.iter() {
+            let target = account.target.lock().await;
+            let bound_user_id = match self.binding_kind {
+                AdapterBindingKind::Line => target.line_user_id.as_str(),
+                AdapterBindingKind::Discord => target.discord_user_id.as_str(),
+            };
+            if !bound_user_id.is_empty() && bound_user_id == user_id {
+                return Some(account);
+            }
+        }
+
+        None
     }
 
     fn is_admin_user(&self, user_id: &str) -> bool {
@@ -209,6 +256,27 @@ impl RequestState {
 
     fn admin_is_unrestricted(&self) -> bool {
         self.messenger.admin_user_id().is_empty()
+    }
+
+    pub async fn set_discord_user_id(&self, account_id: &str, discord_user_id: &str) -> bool {
+        for account in self.accounts.iter() {
+            if account.account_id == account_id {
+                let mut target = account.target.lock().await;
+                target.discord_user_id = discord_user_id.to_string();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub async fn discord_bindings(&self) -> Vec<(String, String)> {
+        let mut bindings = Vec::with_capacity(self.accounts.len());
+        for account in self.accounts.iter() {
+            let target = account.target.lock().await;
+            bindings.push((account.username.clone(), target.discord_user_id.clone()));
+        }
+        bindings
     }
 }
 
@@ -348,7 +416,7 @@ pub async fn execute_command(
                     None
                 }
             } else {
-                state.account_for_user(user_id)
+                state.account_for_user(user_id).await
             };
 
             let Some(account) = account else {
@@ -421,7 +489,7 @@ pub async fn status_message_for_user(
         return OutboundMessage::Status(admin_status_message(state).await);
     }
 
-    match state.account_for_user(user_id) {
+    match state.account_for_user(user_id).await {
         Some(account) => {
             let status = account.monitor_status.lock().await;
             OutboundMessage::Status(StatusMessage::UserAccount {
@@ -652,6 +720,28 @@ mod tests {
         let msg = status_message_for_user(&state, "Ualice", false).await;
 
         match msg {
+            OutboundMessage::Status(StatusMessage::UserAccount { account_id, .. }) => {
+                assert_eq!(account_id, "acc-a");
+            }
+            other => panic!("unexpected status message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discord_binding_updates_runtime_status_lookup() {
+        let (account, _rx) = make_account("acc-a", "");
+        let state = RequestState::new_with_binding(
+            Arc::new(TestMessenger::new("999")),
+            vec![account],
+            AdapterBindingKind::Discord,
+        );
+
+        let before = status_message_for_user(&state, "123", false).await;
+        assert_eq!(before, OutboundMessage::QrNoBoundAccount);
+
+        assert!(state.set_discord_user_id("acc-a", "123").await);
+        let after = status_message_for_user(&state, "123", false).await;
+        match after {
             OutboundMessage::Status(StatusMessage::UserAccount { account_id, .. }) => {
                 assert_eq!(account_id, "acc-a");
             }

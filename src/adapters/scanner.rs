@@ -8,10 +8,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::{
+    extract::State,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tower_http::trace::TraceLayer;
+use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -54,6 +63,17 @@ pub struct QrScannerRegistry {
     public_base_url: String,
     scanner_path: String,
     inner: Arc<Mutex<HashMap<PendingQrKey, PendingQrEntry>>>,
+}
+
+#[derive(Clone)]
+pub struct ScannerHttpState {
+    scanner: Arc<QrScannerRegistry>,
+}
+
+impl ScannerHttpState {
+    pub fn new(scanner: Arc<QrScannerRegistry>) -> Self {
+        Self { scanner }
+    }
 }
 
 impl QrScannerRegistry {
@@ -233,6 +253,53 @@ impl QrScannerRegistry {
             .append_pair("account_id", account_id)
             .append_pair("token", token);
         Ok(base.to_string())
+    }
+}
+
+pub fn build_scanner_router(scanner: Arc<QrScannerRegistry>) -> Router {
+    Router::new()
+        .route("/scanner", get(scanner_page_handler))
+        .route("/scanner/submit", post(scanner_submit_handler))
+        .layer(TraceLayer::new_for_http())
+        .with_state(ScannerHttpState::new(scanner))
+}
+
+pub async fn start_scanner_server(scanner: Arc<QrScannerRegistry>, port: u16) -> Result<()> {
+    let app = build_scanner_router(scanner);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+
+    info!(port = port, "QR scanner 伺服器啟動：http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to bind scanner server to port {port}"))?;
+
+    axum::serve(listener, app)
+        .await
+        .into_diagnostic()
+        .wrap_err("Scanner server error")
+}
+
+async fn scanner_page_handler() -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(include_str!("line/scanner.html")),
+    )
+        .into_response()
+}
+
+async fn scanner_submit_handler(
+    State(state): State<ScannerHttpState>,
+    Json(submission): Json<ScannerSubmission>,
+) -> Response {
+    match state.scanner.submit(submission).await {
+        Ok(result) => (StatusCode::OK, Json(serde_json::json!(result))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 

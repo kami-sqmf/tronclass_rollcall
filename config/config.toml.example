@@ -52,6 +52,17 @@ webhook_path = "/webhook"
 public_base_url = ""
 admin_user_id = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
+[adapters.discord]
+enabled = false
+bot_token = "your_discord_bot_token"
+admin_user_id = "123456789012345678"
+admin_channel_id = "123456789012345678"
+# 外部可連線的 scanner base URL；Discord-only 部署若要使用本機 scanner 請設定。
+public_base_url = ""
+# 啟動時註冊 slash commands；guild_ids 留空時註冊 global commands。
+register_commands = true
+guild_ids = []
+
 # ─── 時區設定 ────────────────────────────────────────────────────────────────
 
 [time]
